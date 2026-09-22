@@ -66,6 +66,12 @@ def _scroll_meta_str(metadata: dict[str, Any]) -> str:
     return "  " + "  ".join(f"[{p}]" for p in parts)
 
 
+def _ref_str(node) -> str:
+    locator = getattr(node, "locator", None)
+    ref = getattr(locator, "ref", 0) if locator is not None else 0
+    return f"@e{ref} " if ref else ""
+
+
 def _render_tree(nodes: list, meta_fn) -> str:
     windows: dict[str, list] = {}
     for node in nodes:
@@ -81,7 +87,8 @@ def _render_tree(nodes: list, meta_fn) -> str:
             name = node.name
             action = _action_for(ctrl)
             meta = meta_fn(node.metadata)
-            lines.append(f'{connector} {coords} {ctrl} "{name}"  [action: {action}]{meta}')
+            ref = _ref_str(node)
+            lines.append(f'{connector} {ref}{coords} {ctrl} "{name}"  [action: {action}]{meta}')
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -117,6 +124,7 @@ class SemanticNode:
     center: Optional["Center"] = None
     bounding_box: Optional["BoundingBox"] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    locator: Any = None
     children: list["SemanticNode"] = field(default_factory=list)
 
     def add_child(self, child: "SemanticNode") -> None:
@@ -134,7 +142,7 @@ def _format_semantic_node(node: SemanticNode) -> str:
         coords = node.center.to_string() if node.center else "(?)"
         action = _action_for(ctrl)
         meta = _node_meta_str(node.metadata) if node.element_type == "interactive" else _scroll_meta_str(node.metadata)
-        return f'{coords} {ctrl} "{name}"  [action: {action}]{meta}'
+        return f'{_ref_str(node)}{coords} {ctrl} "{name}"  [action: {action}]{meta}'
     return f'{ctrl} "{name}"'
 
 
@@ -262,6 +270,7 @@ class TreeElementNode:
     control_type: str = ""
     window_name: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    locator: Any = None
 
     def update_from_node(self, node: "TreeElementNode"):
         self.name = node.name
@@ -270,6 +279,7 @@ class TreeElementNode:
         self.bounding_box = node.bounding_box
         self.center = node.center
         self.metadata = node.metadata
+        self.locator = node.locator
 
 
 @dataclass
@@ -280,6 +290,7 @@ class ScrollElementNode:
     bounding_box: BoundingBox
     center: Center
     metadata: dict[str, Any] = field(default_factory=dict)
+    locator: Any = None
 
 
 @dataclass

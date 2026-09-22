@@ -2,6 +2,7 @@ from __future__ import annotations
 from windows_mcp.uia import Control, ComboBoxControl, DocumentControl, CheckBoxControl, EditControl, ButtonControl, SliderControl, ScrollPattern, WindowControl, ImageControl, Rect, ExpandCollapseState, ToggleState, PatternId, PropertyId, AccessibleRoleNames, TreeScope, ControlFromHandle, UIADeadElementError, from_com_error, TextPatternRangeEndpoint
 from windows_mcp.tree.config import INTERACTIVE_CONTROL_TYPE_NAMES, DOCUMENT_CONTROL_TYPE_NAMES, INFORMATIVE_CONTROL_TYPE_NAMES, DEFAULT_ACTIONS, INTERACTIVE_ROLES, THREAD_MAX_RETRIES, STRUCTURAL_CONTROL_TYPE_NAMES
 from windows_mcp.tree.views import TreeElementNode, ScrollElementNode, TextElementNode, Center, BoundingBox, TreeState, SemanticNode, _prune_structural, _reverse_children_order
+from windows_mcp.refs.locator import ElementLocator
 from windows_mcp.tree.cache_utils import (
     CacheRequestFactory,
     CachedControlHelper,
@@ -251,7 +252,8 @@ class Tree:
         return BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0)
 
     def _append_word_nodes(self, word_elements:list[tuple[str,Rect]], reference_box:Rect, window_name:str,
-                            target_nodes:list[TreeElementNode], current_semantic_node:'Optional[SemanticNode]'=None):
+                            target_nodes:list[TreeElementNode], current_semantic_node:'Optional[SemanticNode]'=None,
+                            window_handle:int=0):
         """Append one interactive `TreeElementNode` (control_type='Word') per (word, rect) pair."""
         for word, rect in word_elements:
             if not self.element_budget.try_consume():
@@ -260,13 +262,17 @@ class Tree:
             if bounding_box.width <= 0 or bounding_box.height <= 0:
                 continue
             center = bounding_box.get_center()
+            word_locator = ElementLocator.synthetic_locator(
+                bounding_box=bounding_box, window_handle=window_handle
+            )
             word_node = TreeElementNode(**{
                 'name':word,
                 'control_type':'Word',
                 'bounding_box':bounding_box,
                 'center':center,
                 'window_name':window_name,
-                'metadata':{}
+                'metadata':{},
+                'locator':word_locator,
             })
             target_nodes.append(word_node)
             if current_semantic_node is not None:
@@ -278,6 +284,7 @@ class Tree:
                     center=center,
                     bounding_box=bounding_box,
                     metadata={},
+                    locator=word_locator,
                 ))
 
 
@@ -381,7 +388,8 @@ class Tree:
                     dom_interactive_nodes:Optional[list[TreeElementNode]]=None, dom_informative_nodes:Optional[list[TextElementNode]]=None,
                     is_dom:bool=False, is_dialog:bool=False,
                     element_cache_req:Optional[Any]=None, children_cache_req:Optional[Any]=None,
-                    current_semantic_node:'Optional[SemanticNode]'=None):
+                    current_semantic_node:'Optional[SemanticNode]'=None,
+                    window_handle:int=0, index_path:tuple=()):
         try:
             # Build cached control if caching is enabled
             if not hasattr(node, '_is_cached') and element_cache_req:
@@ -414,20 +422,30 @@ class Tree:
 
                             sem_scroll_name = name.strip() or automation_id or localized_control_type.capitalize() or "''"
                             self.element_budget.try_consume()
+                            scroll_box = BoundingBox(**{
+                                'left':box.left,
+                                'top':box.top,
+                                'right':box.right,
+                                'bottom':box.bottom,
+                                'width':box.width(),
+                                'height':box.height()
+                            })
+                            scroll_locator = ElementLocator.from_control(
+                                node,
+                                name=sem_scroll_name,
+                                control_type=control_type_name,
+                                window_handle=window_handle,
+                                index_path=index_path,
+                                bounding_box=scroll_box,
+                            )
                             scrollable_nodes.append(ScrollElementNode(**{
                                 'name':sem_scroll_name,
                                 'control_type':localized_control_type.title(),
-                                'bounding_box':BoundingBox(**{
-                                    'left':box.left,
-                                    'top':box.top,
-                                    'right':box.right,
-                                    'bottom':box.bottom,
-                                    'width':box.width(),
-                                    'height':box.height()
-                                }),
+                                'bounding_box':scroll_box,
                                 'center':center,
                                 'window_name':window_name,
-                                'metadata':metadata
+                                'metadata':metadata,
+                                'locator':scroll_locator,
                             }))
                             if current_semantic_node is not None and not is_dom:
                                 current_semantic_node.add_child(SemanticNode(
@@ -436,11 +454,9 @@ class Tree:
                                     name=sem_scroll_name,
                                     window_name=window_name,
                                     center=center,
-                                    bounding_box=BoundingBox(
-                                        left=box.left, top=box.top, right=box.right, bottom=box.bottom,
-                                        width=box.width(), height=box.height()
-                                    ),
+                                    bounding_box=scroll_box,
                                     metadata=dict(metadata),
+                                    locator=scroll_locator,
                                 ))
                                 semantic_added = True
                     except Exception:
@@ -665,29 +681,47 @@ class Tree:
                             if is_browser and is_dom:
                                 bounding_box=self.iou_bounding_box(self.dom_bounding_box,element_bounding_box)
                                 center = bounding_box.get_center()
+                                dom_locator = ElementLocator.from_control(
+                                    node,
+                                    name=name,
+                                    control_type=control_type_name,
+                                    window_handle=window_handle,
+                                    index_path=index_path,
+                                    bounding_box=bounding_box,
+                                )
                                 tree_node=TreeElementNode(**{
                                     'name':name,
                                     'control_type':localized_control_type.title(),
                                     'bounding_box':bounding_box,
                                     'center':center,
                                     'window_name':window_name,
-                                    'metadata':metadata
+                                    'metadata':metadata,
+                                    'locator':dom_locator,
                                 })
                                 self.element_budget.try_consume()
                                 dom_interactive_nodes.append(tree_node)
                                 self._dom_correction(node, dom_interactive_nodes, window_name)
-                                self._append_word_nodes(word_elements, self.dom_bounding_box, window_name, dom_interactive_nodes)
+                                self._append_word_nodes(word_elements, self.dom_bounding_box, window_name, dom_interactive_nodes, window_handle=window_handle)
                             else:
                                 bounding_box=self.iou_bounding_box(window_bounding_box,element_bounding_box)
                                 center = bounding_box.get_center()
                                 if name:
+                                    elem_locator = ElementLocator.from_control(
+                                        node,
+                                        name=name,
+                                        control_type=control_type_name,
+                                        window_handle=window_handle,
+                                        index_path=index_path,
+                                        bounding_box=bounding_box,
+                                    )
                                     tree_node=TreeElementNode(**{
                                         'name':name,
                                         'control_type':localized_control_type.title(),
                                         'bounding_box':bounding_box,
                                         'center':center,
                                         'window_name':window_name,
-                                        'metadata':metadata
+                                        'metadata':metadata,
+                                        'locator':elem_locator,
                                     })
                                     self.element_budget.try_consume()
                                     interactive_nodes.append(tree_node)
@@ -700,9 +734,10 @@ class Tree:
                                             center=tree_node.center,
                                             bounding_box=tree_node.bounding_box,
                                             metadata=dict(tree_node.metadata),
+                                            locator=elem_locator,
                                         ))
                                         semantic_added = True
-                                self._append_word_nodes(word_elements, window_bounding_box, window_name, interactive_nodes, current_semantic_node)
+                                self._append_word_nodes(word_elements, window_bounding_box, window_name, interactive_nodes, current_semantic_node, window_handle=window_handle)
 
                     # Informative Check
                     if dom_informative_nodes is not None:
@@ -754,13 +789,17 @@ class Tree:
             # Phase 3: Cached Children Retrieval
             children = CachedControlHelper.get_cached_children(node, children_cache_req)
 
-            # Recursively traverse the tree the right to left for normal apps and for DOM traverse from left to right
-            for child in (children if is_dom else reversed(children)):
+            # Recursively traverse the tree the right to left for normal apps and for DOM traverse from left to right.
+            # Each child is tagged with its position in the canonical children list so the
+            # ref locator can later re-walk the same index_path.
+            indexed_children = list(enumerate(children))
+            for child_index, child in (indexed_children if is_dom else reversed(indexed_children)):
                 if self.element_budget.exhausted:
                     # Stop descending once the element budget is spent — this is what
                     # bounds traversal time on huge flat lists/grids (thousands of rows),
                     # not just the size of the appended node lists.
                     break
+                child_path = index_path + (child_index,)
                 try:
                     # Check if the child is a DOM element
                     if is_browser and child.CachedAutomationId=="RootWebArea":
@@ -770,7 +809,7 @@ class Tree:
                         height=bounding_box.height())
                         self.dom=child
                         # enter DOM subtree
-                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=True, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=None)
+                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=True, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=None, window_handle=window_handle, index_path=child_path)
                     # Check if the child is a dialog
                     elif isinstance(child,WindowControl):
                         if not child.CachedIsOffscreen:
@@ -790,10 +829,10 @@ class Tree:
                                 if is_modal:
                                     interactive_nodes.clear()
                         # enter dialog subtree
-                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=True, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent)
+                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=True, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent, window_handle=window_handle, index_path=child_path)
                     else:
                         # normal non-dialog children
-                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent)
+                        self.tree_traversal(child, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=is_dom, is_dialog=is_dialog, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=semantic_parent, window_handle=window_handle, index_path=child_path)
                 except TypeError as e:
                     if not _is_comtypes_variant_ord_typeerror(e):
                         raise
@@ -862,7 +901,7 @@ class Tree:
                     window_name=window_name,
                 )
 
-            self.tree_traversal(node, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=False, is_dialog=False, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=window_sem_node)
+            self.tree_traversal(node, window_bounding_box, window_name, is_browser, interactive_nodes, scrollable_nodes, dom_interactive_nodes, dom_informative_nodes, is_dom=False, is_dialog=False, element_cache_req=element_cache_req, children_cache_req=children_cache_req, current_semantic_node=window_sem_node, window_handle=handle, index_path=())
 
             # IA2 fallback: Firefox doesn't expose RootWebArea via UIA, so the traversal
             # above finds no DOM content. If this is a browser window and UIA gave us no

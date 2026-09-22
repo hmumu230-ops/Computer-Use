@@ -10,6 +10,10 @@ from mcp.types import ToolAnnotations
 from windows_mcp.infrastructure import with_analytics
 from fastmcp import Context
 
+from windows_mcp.desktop import actions
+from windows_mcp.refs import RefStore
+from windows_mcp.refs.locator import ElementLocator
+
 
 WaitForCondition = Literal[
     "text_exists",
@@ -28,6 +32,52 @@ def _resolve_label(desktop: Any, label: int) -> list[int]:
         return list(desktop.get_coordinates_from_label(label))
     except Exception as e:
         raise ValueError(f"Failed to find element with label {label}: {e}")
+
+
+def _resolve_target(
+    desktop: Any,
+    loc: list | None,
+    label: int | None,
+    ref: str | None,
+) -> tuple[int, int, str, ElementLocator | None]:
+    """Resolve a click target to (x, y, via_note, locator).
+
+    Precedence: ref > label > loc. ref/label resolve through the ref store to a
+    live element (fresh coordinates, survives relayout); loc is raw screen
+    coordinates with no element identity (locator=None). The `via` note is
+    appended to tool responses for transparency.
+    """
+    if ref is not None:
+        locator = desktop.ref_store.resolve(RefStore.parse_ref(ref))
+        x, y = desktop._locator_center(locator)
+        return x, y, f"@e{locator.ref} ({locator.control_type} {locator.name!r})", locator
+    if label is not None:
+        locator = desktop.resolve_label_locator(label)
+        if locator is not None:
+            x, y = desktop._locator_center(locator)
+            return (
+                x,
+                y,
+                f"label {label} -> @e{locator.ref} ({locator.control_type} {locator.name!r})",
+                locator,
+            )
+        x, y = _resolve_label(desktop, label)
+        return x, y, f"label {label}", None
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref, label, or loc=[x, y].")
+    return loc[0], loc[1], f"({loc[0]},{loc[1]})", None
+
+
+def _check_method(method: str) -> str:
+    normalized = method.strip().lower()
+    if normalized not in ("auto", "invoke", "synthetic"):
+        raise ValueError("method must be one of: auto, invoke, synthetic")
+    return normalized
+
+
+def _pattern_required(method: str) -> bool:
+    """True when the caller forbids the synthetic-input fallback."""
+    return method == "invoke"
 
 
 def _as_bool(value: bool | str, name: str) -> bool:
@@ -223,10 +273,15 @@ def register(
     @mcp.tool(
         name="Click",
         description=(
-            "Performs mouse clicks at specified coordinates [x, y] or passing a UI element's label/id. "
+            "Performs mouse clicks at specified coordinates [x, y], a UI element's label/id, "
+            "or an @eN ref from the latest Snapshot (preferred: resolves to a live element, "
+            "survives relayout). "
             "Supports button types: 'left' for selection/activation, 'right' for context menus, 'middle'. "
             "Supports clicks: 0=hover only (no click), 1=single click (select/focus), 2=double click (open/activate). "
-            "Provide either loc or label."
+            "method controls execution: 'auto' (default) tries UIA patterns (invoke/toggle/select — no cursor "
+            "movement, works in background) then falls back to synthetic input; 'invoke' requires a pattern and "
+            "never touches the mouse (errors when unsupported); 'synthetic' always uses real mouse input. "
+            "Provide one of ref, label, or loc."
         ),
         annotations=ToolAnnotations(
             title="Click",
@@ -240,26 +295,45 @@ def register(
     def click_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
+        ref: str | None = None,
         button: Literal["left", "right", "middle"] = "left",
         clicks: int = 1,
+        method: Literal["auto", "invoke", "synthetic"] = "auto",
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
         loc = _as_loc(loc)
-        if loc is None and label is None:
-            raise ValueError("Either loc or label must be provided.")
-        if label is not None:
-            loc = _resolve_label(desktop, label)
-        if len(loc) != 2:
-            raise ValueError("Location must be a list of exactly 2 integers [x, y]")
-        x, y = loc[0], loc[1]
-        desktop.click(loc=loc, button=button, clicks=clicks)
+        method = _check_method(method)
+        x, y, via, locator = _resolve_target(desktop, loc, label, ref)
         num_clicks = {0: "Hover", 1: "Single", 2: "Double"}
-        return f"{num_clicks.get(clicks)} {button} clicked at ({x},{y})."
+
+        if locator is not None and method != "synthetic" and button == "left" and clicks == 1:
+            result = actions.activate(locator)
+            if result is not None:
+                observed = actions.format_observed(result["changes"], result["after"])
+                return (
+                    f"Single left clicked {via} at ({x},{y}) "
+                    f"via {result['method']}.{observed}"
+                )
+            if _pattern_required(method):
+                raise ValueError(
+                    f"method='invoke' but no UIA pattern applies to {via} "
+                    f"({locator.control_type} {locator.name!r}). Use method='auto' to allow "
+                    "synthetic input fallback."
+                )
+        elif _pattern_required(method) and locator is None:
+            raise ValueError(
+                "method='invoke' requires ref or label targeting a UIA element; "
+                "raw loc has no element to invoke."
+            )
+
+        desktop.click(loc=[x, y], button=button, clicks=clicks)
+        suffix = " (synthetic)" if locator is not None and method == "auto" else ""
+        return f"{num_clicks.get(clicks)} {button} clicked at ({x},{y}) on {via}{suffix}."
 
     @mcp.tool(
         name="Type",
-        description="Types text at specified coordinates [x, y] or passing a UI element's label/id. Set clear=True to clear existing text first, False to append. Set press_enter=True to submit after typing. Set caret_position to 'start' (beginning), 'end' (end), or 'idle' (default). Provide either loc or label.",
+        description="Types text at specified coordinates [x, y], a UI element's label/id, or an @eN ref from the latest Snapshot (preferred). Set clear=True to clear existing text first, False to append. Set press_enter=True to submit after typing. Set caret_position to 'start' (beginning), 'end' (end), or 'idle' (default). method: 'auto' uses UIA ValuePattern (instant, no focus steal) when clear=True and the element supports it; 'invoke' requires it; 'synthetic' always simulates keystrokes. Provide one of ref, label, or loc.",
         annotations=ToolAnnotations(
             title="Type",
             readOnlyHint=False,
@@ -273,32 +347,59 @@ def register(
         text: str,
         loc: list[int] | str | None = None,
         label: int | None = None,
+        ref: str | None = None,
         clear: bool | str = False,
         caret_position: Literal["start", "idle", "end"] = "idle",
         press_enter: bool | str = False,
+        method: Literal["auto", "invoke", "synthetic"] = "auto",
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
         loc = _as_loc(loc)
-        if loc is None and label is None:
-            raise ValueError("Either loc or label must be provided.")
-        if label is not None:
-            loc = _resolve_label(desktop, label)
-        if len(loc) != 2:
-            raise ValueError("Location must be a list of exactly 2 integers [x, y]")
-        x, y = loc[0], loc[1]
+        method = _check_method(method)
+        x, y, via, locator = _resolve_target(desktop, loc, label, ref)
+        clear_bool = _as_bool(clear, "clear")
+        enter_bool = _as_bool(press_enter, "press_enter")
+
+        # ValuePattern is full-content replace — only correct for clear-and-set,
+        # and can't satisfy caret positioning or a trailing Enter.
+        setvalue_ok = (
+            locator is not None
+            and method != "synthetic"
+            and clear_bool
+            and not enter_bool
+            and caret_position == "idle"
+        )
+        if setvalue_ok:
+            result = actions.fill_value(locator, text)
+            if result is not None:
+                observed = actions.format_observed(result["changes"], result["after"])
+                return f"Typed {text!r} into {via} via setvalue.{observed}"
+            if _pattern_required(method):
+                raise ValueError(
+                    f"method='invoke' but ValuePattern is not supported by {via} "
+                    f"({locator.control_type} {locator.name!r}). Use method='auto' to allow "
+                    "synthetic typing fallback."
+                )
+        elif _pattern_required(method) and locator is None:
+            raise ValueError(
+                "method='invoke' requires ref or label targeting a UIA element; "
+                "raw loc has no element."
+            )
+
         desktop.type(
-            loc=loc,
+            loc=[x, y],
             text=text,
             caret_position=caret_position,
             clear=clear,
             press_enter=press_enter,
         )
-        return f"Typed {text} at ({x},{y})."
+        suffix = " (synthetic)" if locator is not None and method == "auto" else ""
+        return f"Typed {text} at ({x},{y}) on {via}{suffix}."
 
     @mcp.tool(
         name="Scroll",
-        description="Scrolls at coordinates [x, y], a UI element's label/id, or current mouse position if loc=None. Type: vertical (default) or horizontal. Direction: up/down for vertical, left/right for horizontal. wheel_times controls amount (1 wheel ≈ 3-5 lines). Use for navigating long content, lists, and web pages.",
+        description="Scrolls at coordinates [x, y], a UI element's label/id, an @eN ref, or current mouse position if all are omitted. Type: vertical (default) or horizontal. Direction: up/down for vertical, left/right for horizontal. wheel_times controls amount (1 wheel ≈ 3-5 lines). Use for navigating long content, lists, and web pages.",
         annotations=ToolAnnotations(
             title="Scroll",
             readOnlyHint=False,
@@ -311,6 +412,7 @@ def register(
     def scroll_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
+        ref: str | None = None,
         type: Literal["horizontal", "vertical"] = "vertical",
         direction: Literal["up", "down", "left", "right"] = "down",
         wheel_times: int = 1,
@@ -318,8 +420,10 @@ def register(
     ) -> str:
         desktop = get_desktop()
         loc = _as_loc(loc)
-        if label is not None:
-            loc = _resolve_label(desktop, label)
+        via = "current position"
+        if ref is not None or label is not None:
+            x, y, via, _locator = _resolve_target(desktop, loc, label, ref)
+            loc = [x, y]
         if loc and len(loc) != 2:
             raise ValueError("Location must be a list of exactly 2 integers [x, y]")
         response = desktop.scroll(loc, type, direction, wheel_times)
@@ -327,7 +431,7 @@ def register(
             return response
         return (
             f"Scrolled {type} {direction} by {wheel_times} wheel times"
-            + f" at ({loc[0]},{loc[1]})."
+            + f" at ({loc[0]},{loc[1]}) on {via}."
             if loc
             else ""
         )
@@ -335,12 +439,12 @@ def register(
     @mcp.tool(
         name="Move",
         description=(
-            "Moves mouse cursor to coordinates [x, y] or passing a UI element's label/id. "
+            "Moves mouse cursor to coordinates [x, y], a UI element's label/id, or an @eN ref. "
             "Set drag=True to perform a drag-and-drop operation from the current mouse position "
             "to the target coordinates, or provide from_loc=[x, y] to make the drag explicit-start "
             "and atomic in one tool call. Optional duration controls bounded intermediate movement. "
             "Default (drag=False) is a simple cursor move (hover). "
-            "Provide either loc or label."
+            "Provide one of ref, label, or loc."
         ),
         annotations=ToolAnnotations(
             title="Move",
@@ -354,6 +458,7 @@ def register(
     def move_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
+        ref: str | None = None,
         drag: bool | str = False,
         from_loc: list[int] | str | None = None,
         duration: float | int | str | None = None,
@@ -363,12 +468,12 @@ def register(
         loc = _as_loc(loc)
         from_loc = _as_loc(from_loc)
         drag = _as_bool(drag, "drag")
-        if loc is None and label is None:
-            raise ValueError("Either loc or label must be provided.")
-        if label is not None:
-            loc = _resolve_label(desktop, label)
+        via = None
+        if ref is not None or label is not None:
+            x, y, via, _locator = _resolve_target(desktop, loc, label, ref)
+            loc = [x, y]
         if not isinstance(loc, list) or len(loc) != 2:
-            raise ValueError("loc must be a list of exactly 2 integers [x, y]")
+            raise ValueError("Provide ref, label, or loc=[x, y].")
         if from_loc is not None and (not isinstance(from_loc, list) or len(from_loc) != 2):
             raise ValueError("from_loc must be a list of exactly 2 integers [x, y]")
         has_drag_only_options = any(

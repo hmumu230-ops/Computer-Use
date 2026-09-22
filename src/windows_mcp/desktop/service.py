@@ -10,6 +10,7 @@ from windows_mcp.vdm.core import (
 )
 from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size, Display
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState, SemanticNode
+from windows_mcp.refs import ElementLocator, RefError, RefStore
 from PIL import ImageFont, ImageDraw, Image
 from windows_mcp.tree.service import Tree
 from windows_mcp.desktop import screenshot as screenshot_capture
@@ -80,6 +81,15 @@ class Desktop:
         self.encoding = getpreferredencoding()
         self.tree = Tree(self)
         self.desktop_state = None
+        self._ref_store = RefStore()
+
+    @property
+    def ref_store(self) -> RefStore:
+        """Lazily-initialized ref store — survives __init__ being patched away in tests."""
+        store = self.__dict__.get("_ref_store")
+        if store is None:
+            store = self.__dict__["_ref_store"] = RefStore()
+        return store
 
     def get_state(
         self,
@@ -217,6 +227,9 @@ class Desktop:
         if profile_enabled:
             region_filter_ms = (perf_counter() - stage_started_at) * 1000
             stage_started_at = perf_counter()
+
+        if use_ui_tree:
+            self._rebuild_refs(tree_state)
 
         screenshot_original_size = None
         applied_scale = None
@@ -679,6 +692,54 @@ class Desktop:
                     raise IndexError(f"Label {label} out of range")
             results.append((element_node.center.x, element_node.center.y))
         return results
+
+    # -- ref support ------------------------------------------------------
+
+    def _rebuild_refs(self, tree_state: TreeState) -> None:
+        """(Re)assign refs to the freshly captured tree's element locators.
+
+        Nodes that carry no locator (e.g. IA2-derived nodes) get a synthetic
+        coordinate-only locator so every rendered element is ref-addressable.
+        """
+        locators = []
+        for node in tree_state.interactive_nodes + tree_state.scrollable_nodes:
+            locator = getattr(node, "locator", None)
+            if locator is None:
+                locator = ElementLocator.synthetic_locator(
+                    bounding_box=node.bounding_box
+                )
+                node.locator = locator
+            locators.append(locator)
+        self.ref_store.rebuild(locators)
+
+    def _locator_center(self, locator: ElementLocator) -> tuple[int, int]:
+        """Fresh center point for a resolved locator."""
+        box = locator.bounding_box
+        if box is not None:
+            return box.left + box.width // 2, box.top + box.height // 2
+        if locator.control is not None:
+            rect = locator.control.BoundingRectangle
+            return rect.left + rect.width() // 2, rect.top + rect.height() // 2
+        raise RefError(
+            "ELEMENT_NOT_FOUND",
+            f"@e{locator.ref} has no usable position",
+            hint="call Snapshot to refresh",
+        )
+
+    def resolve_ref(self, ref: str | int) -> tuple[int, int]:
+        """Resolve an @eN ref to fresh screen coordinates."""
+        locator = self.ref_store.resolve(RefStore.parse_ref(ref))
+        return self._locator_center(locator)
+
+    def resolve_label_locator(self, label: int) -> ElementLocator | None:
+        """Resolve a legacy numeric label via the ref store.
+
+        Returns None when the store has no current snapshot (callers then use
+        the legacy index path).
+        """
+        if not self.ref_store.latest:
+            return None
+        return self.ref_store.resolve_index(label)
 
     def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1):
         if isinstance(loc, list):

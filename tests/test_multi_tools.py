@@ -85,11 +85,15 @@ def test_multiselect_uses_bulk_coordinate_resolution():
 def test_multiedit_uses_bulk_coordinate_resolution():
     desktop = MagicMock()
     desktop.desktop_state = object()
+    desktop.resolve_label_locator.return_value = None
     desktop.get_coordinates_from_labels.return_value = [(10, 10), (40, 40)]
 
     tools = register_tools(desktop)
     result = asyncio.run(tools["MultiEdit"](labels=[[0, "First"], [1, "Second"]]))
 
-    assert result == "Multi-edited elements at: (10,10) with text 'First', (40,40) with text 'Second'"
     desktop.get_coordinates_from_labels.assert_called_once_with([0, 1])
-    desktop.multi_edit.assert_called_once_with([[10, 10, "First"], [40, 40, "Second"]])
+    assert desktop.type.call_count == 2
+    desktop.type.assert_any_call((10, 10), text="First", clear=True)
+    desktop.type.assert_any_call((40, 40), text="Second", clear=True)
+    assert "Multi-edited 2/2 field(s)." in result
+    assert "label 0" in result and "label 1" in result

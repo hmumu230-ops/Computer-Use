@@ -3,7 +3,10 @@
 import json
 
 from mcp.types import ToolAnnotations
+from windows_mcp.desktop import actions
 from windows_mcp.infrastructure import with_analytics
+from windows_mcp.refs import RefStore
+from windows_mcp.refs.locator import ElementLocator
 from fastmcp import Context
 
 
@@ -17,7 +20,7 @@ def _as_loc(value: list | str | None) -> list | None:
 def register(mcp, *, get_desktop, get_analytics):
     @mcp.tool(
         name="MultiSelect",
-        description="Selects multiple items such as files, folders, or checkboxes if press_ctrl=True, or performs multiple clicks if False. Pass locs (list of coordinates) or labels (list of UI element labels/ids).",
+        description="Selects multiple items such as files, folders, or checkboxes if press_ctrl=True, or performs multiple clicks if False. Pass refs (list of @eN refs — preferred), locs (list of coordinates), or labels (list of UI element labels/ids).",
         annotations=ToolAnnotations(
             title="MultiSelect",
             readOnlyHint=False,
@@ -30,15 +33,21 @@ def register(mcp, *, get_desktop, get_analytics):
     def multi_select_tool(
         locs: list[list[int]] | str | None = None,
         labels: list[int] | str | None = None,
+        refs: list[str] | str | None = None,
         press_ctrl: bool | str = True,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
         locs = _as_loc(locs)
         labels = _as_loc(labels)
-        if locs is None and labels is None:
-            raise ValueError("Either locs or labels must be provided.")
+        refs = _as_loc(refs)
+        if locs is None and labels is None and refs is None:
+            raise ValueError("At least one of refs, locs, or labels must be provided.")
         locs = locs or []
+        if refs is not None:
+            for item in refs:
+                locator = desktop.ref_store.resolve(RefStore.parse_ref(item))
+                locs.append(list(desktop._locator_center(locator)))
         if labels is not None:
             if desktop.desktop_state is None:
                 raise ValueError("Desktop state is empty. Please call Snapshot first.")
@@ -57,7 +66,15 @@ def register(mcp, *, get_desktop, get_analytics):
 
     @mcp.tool(
         name="MultiEdit",
-        description="Enters text into multiple input fields at specified coordinates locs=[[x,y,text], ...] or using labels=[[label,text], ...]. Provide either locs or labels.",
+        description=(
+            "Enters text into multiple input fields in one call. Target each field by "
+            "refs=[[ref,text], ...] (@eN refs from Snapshot — preferred: resolves live "
+            "elements, survives relayout, uses UIA ValuePattern when available), "
+            "labels=[[label,text], ...] (numeric snapshot ids), or locs=[[x,y,text], ...] "
+            "(raw coordinates). At least one of refs/labels/locs is required; they may "
+            "be combined. Returns per-field results including method (setvalue/synthetic) "
+            "and observed value changes."
+        ),
         annotations=ToolAnnotations(
             title="MultiEdit",
             readOnlyHint=False,
@@ -70,36 +87,77 @@ def register(mcp, *, get_desktop, get_analytics):
     def multi_edit_tool(
         locs: list[list] | str | None = None,
         labels: list[list] | str | None = None,
+        refs: list[list] | str | None = None,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
         locs = _as_loc(locs)
         labels = _as_loc(labels)
-        if locs is None and labels is None:
-            raise ValueError("Either locs or labels must be provided.")
-        locs = locs or []
+        refs = _as_loc(refs)
+        if locs is None and labels is None and refs is None:
+            raise ValueError("At least one of refs, labels, or locs must be provided.")
+
+        # Each entry: (locator_or_None, x, y, text, via)
+        fields: list[tuple[object, int, int, str, str]] = []
+
+        if refs is not None:
+            for item in refs:
+                if len(item) != 2:
+                    raise ValueError(f"Each refs item must be [ref, text]. Invalid: {item}")
+                locator = desktop.ref_store.resolve(RefStore.parse_ref(item[0]))
+                x, y = desktop._locator_center(locator)
+                via = f"@e{locator.ref} ({locator.control_type} {locator.name!r})"
+                fields.append((locator, x, y, str(item[1]), via))
+
         if labels is not None:
             if desktop.desktop_state is None:
                 raise ValueError("Desktop state is empty. Please call Snapshot first.")
-
-            # Pre-validate and extract labels and texts
-            processed_labels = []
+            # fields-index → (label_id) entries needing bulk coordinate fallback
+            unresolved: list[tuple[int, int]] = []
             for item in labels:
                 if len(item) != 2:
                     raise ValueError(f"Each label item must be [label, text]. Invalid: {item}")
                 try:
-                    processed_labels.append((int(item[0]), item[1]))
+                    label_id = int(item[0])
                 except (ValueError, TypeError):
                     raise ValueError(f"Invalid label id in item: {item}")
+                locator = desktop.resolve_label_locator(label_id)
+                if isinstance(locator, ElementLocator):
+                    x, y = desktop._locator_center(locator)
+                    via = f"label {label_id} -> @e{locator.ref} ({locator.control_type} {locator.name!r})"
+                    fields.append((locator, x, y, str(item[1]), via))
+                else:
+                    fields.append((None, 0, 0, str(item[1]), f"label {label_id}"))
+                    unresolved.append((len(fields) - 1, label_id))
+            if unresolved:
+                label_ids = [u[1] for u in unresolved]
+                resolved = desktop.get_coordinates_from_labels(label_ids)
+                for (idx, label_id), (x, y) in zip(unresolved, resolved):
+                    _, _, _, text, via = fields[idx]
+                    fields[idx] = (None, x, y, text, via)
 
+        for item in locs or []:
+            if len(item) != 3:
+                raise ValueError(f"Each locs item must be [x, y, text]. Invalid: {item}")
+            fields.append((None, int(item[0]), int(item[1]), str(item[2]), f"({item[0]},{item[1]})"))
+
+        results = []
+        failures = []
+        for locator, x, y, text, via in fields:
             try:
-                label_ids = [item[0] for item in processed_labels]
-                resolved_coords = desktop.get_coordinates_from_labels(label_ids)
-                for (x, y), (_, text) in zip(resolved_coords, processed_labels):
-                    locs.append([x, y, text])
+                if locator is not None:
+                    result = actions.fill_value(locator, text)
+                    if result is not None:
+                        observed = actions.format_observed(result["changes"], result["after"])
+                        results.append(f"{via}: setvalue -> {text!r}.{observed}")
+                        continue
+                desktop.type((x, y), text=text, clear=True)
+                results.append(f"{via}: typed {text!r} (synthetic)")
             except Exception as e:
-                raise ValueError(f"Failed to process labels: {e}")
+                failures.append(f"{via}: FAILED ({e})")
+                results.append(f"{via}: FAILED ({e})")
 
-        desktop.multi_edit(locs)
-        elements_str = ", ".join([f"({e[0]},{e[1]}) with text '{e[2]}'" for e in locs])
-        return f"Multi-edited elements at: {elements_str}"
+        summary = f"Multi-edited {len(results) - len(failures)}/{len(results)} field(s)."
+        if failures:
+            summary += f" Failures: {'; '.join(failures)}"
+        return summary + "\n" + "\n".join(f"  - {r}" for r in results)
