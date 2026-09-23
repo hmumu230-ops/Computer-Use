@@ -1,9 +1,38 @@
 """Shared fixtures and configuration for tests."""
 
+import importlib.util
+
 import pytest
 from unittest.mock import Mock, MagicMock
 from macos_mcp.desktop.views import Window, Status
 from macos_mcp.tree.views import TreeState, TreeElementNode, Center, BoundingBox
+
+
+# Tests that only need pure-Python modules (no PyObjC). Everything else is
+# skipped at collection time when PyObjC frameworks are unavailable — e.g.
+# when running the suite on a non-macOS dev box.
+_PURE_PYTHON_TESTS = {
+    "test_check_versions.py",
+    "test_desktop_config.py",
+    "test_desktop_views.py",
+    "test_refs.py",
+    "test_tree_views.py",
+}
+
+
+def _has_pyobjc() -> bool:
+    return all(
+        importlib.util.find_spec(mod) is not None
+        for mod in ("Quartz", "ApplicationServices", "Cocoa")
+    )
+
+
+if not _has_pyobjc():
+    collect_ignore = [
+        f.name
+        for f in __import__("pathlib").Path(__file__).parent.glob("test_*.py")
+        if f.name not in _PURE_PYTHON_TESTS
+    ]
 
 
 @pytest.fixture
