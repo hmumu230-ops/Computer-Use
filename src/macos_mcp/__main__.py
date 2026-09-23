@@ -6,6 +6,7 @@ Provides tools to interact with the macOS desktop for automation.
 
 from macos_mcp.desktop.service import Desktop
 from macos_mcp.desktop.views import Size
+from macos_mcp import safety
 from macos_mcp.watchdog import WatchDog
 from macos_mcp.permissions import validate_permissions
 from macos_mcp.infrastructure import (
@@ -218,8 +219,11 @@ async def shell_tool(
     command: str,
     mode: Literal["shell", "osascript"] = "shell",
     timeout: int = 10,
+    confirmToken: str = "",
     ctx: Context = None,
 ) -> str:
+    safety.gate("shell:exec", {"command": command, "mode": mode},
+                dangerous=False, token=confirmToken)
     response, status_code = await desktop.async_execute_command(command, mode=mode, timeout=timeout)
     mode_label = "AppleScript" if mode == "osascript" else "Shell"
     return f"{mode_label} Response: {response}\nStatus Code: {status_code}"
@@ -289,7 +293,7 @@ async def state_tool(use_vision: bool = False, ctx: Context = None):
 
 @mcp.tool(
     name="Click",
-    description="Performs mouse clicks at specified coordinates [x, y]. Supports button types: 'left' for selection/activation, 'right' for context menus, 'middle'. Supports clicks: 0=hover only, 1=single click, 2=double click.",
+    description="Performs mouse clicks — pass ref='@eN' for a Snapshot element (tries its AX action first, falls back to coordinates) or loc=[x, y] for raw coordinates. Supports button types: 'left' for selection/activation, 'right' for context menus, 'middle'. Supports clicks: 0=hover only, 1=single click, 2=double click.",
     annotations=ToolAnnotations(
         title="Click",
         readOnlyHint=False,
@@ -299,13 +303,16 @@ async def state_tool(use_vision: bool = False, ctx: Context = None):
     ),
 )
 async def click_tool(
-    loc: list[int],
+    loc: list[int] | None = None,
     button: Literal["left", "right", "middle"] = "left",
     clicks: int = 1,
+    ref: str | None = None,
     ctx: Context = None,
 ) -> str:
-    if len(loc) != 2:
-        raise ValueError("Location must be a list of exactly 2 integers [x, y]")
+    if ref:
+        return await desktop.async_click_ref(ref, button, clicks)
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref='@eN' or loc as exactly 2 integers [x, y]")
     x, y = loc[0], loc[1]
     await desktop.async_click(loc=(x, y), button=button, clicks=clicks)
     num_clicks = {0: "Hover", 1: "Single", 2: "Double"}
@@ -314,7 +321,7 @@ async def click_tool(
 
 @mcp.tool(
     name="Type",
-    description="Types text at specified coordinates [x, y]. Set clear=True to clear existing text first. Set press_enter=True to submit after typing. Set caret_position to 'start', 'end', or 'idle' (default).",
+    description="Types text — pass ref='@eN' to target a Snapshot element (focuses it, sets AXValue when settable, else clicks + types) or loc=[x, y] for coordinates. Set clear=True to clear existing text first. Set press_enter=True to submit after typing. Set caret_position to 'start', 'end', or 'idle' (default).",
     annotations=ToolAnnotations(
         title="Type",
         readOnlyHint=False,
@@ -324,15 +331,18 @@ async def click_tool(
     ),
 )
 async def type_tool(
-    loc: list[int],
-    text: str,
+    loc: list[int] | None = None,
+    text: str = "",
     clear: bool = False,
     caret_position: Literal["start", "idle", "end"] = "idle",
     press_enter: bool = False,
+    ref: str | None = None,
     ctx: Context = None,
 ) -> str:
-    if len(loc) != 2:
-        raise ValueError("Location must be a list of exactly 2 integers [x, y]")
+    if ref:
+        return await desktop.async_type_ref(ref, text, clear, press_enter)
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref='@eN' or loc as exactly 2 integers [x, y]")
     x, y = loc[0], loc[1]
     await desktop.async_type(
         loc=(x, y),
@@ -346,7 +356,7 @@ async def type_tool(
 
 @mcp.tool(
     name="Scroll",
-    description="Scrolls at coordinates [x, y] or current mouse position if loc=None. Type: vertical (default) or horizontal. Direction: up/down for vertical, left/right for horizontal. wheel_times controls scroll amount.",
+    description="Scrolls at ref='@eN' (element center), coordinates [x, y], or current mouse position if neither is given. Type: vertical (default) or horizontal. Direction: up/down for vertical, left/right for horizontal. wheel_times controls scroll amount.",
     annotations=ToolAnnotations(
         title="Scroll",
         readOnlyHint=False,
@@ -360,8 +370,11 @@ async def scroll_tool(
     type: Literal["horizontal", "vertical"] = "vertical",
     direction: Literal["up", "down", "left", "right"] = "down",
     wheel_times: int = 1,
+    ref: str | None = None,
     ctx: Context = None,
 ) -> str:
+    if ref:
+        loc = list(await desktop.async_ref_center(ref))
     if loc and len(loc) != 2:
         raise ValueError("Location must be a list of exactly 2 integers [x, y]")
     response = await desktop.async_scroll(tuple(loc) if loc else None, type, direction, wheel_times)
@@ -374,7 +387,7 @@ async def scroll_tool(
 
 @mcp.tool(
     name="Move",
-    description="Moves mouse cursor to coordinates [x, y]. Set drag=True to perform a drag-and-drop operation from current position to target coordinates.",
+    description="Moves mouse cursor to ref='@eN' (element center) or coordinates [x, y]. Set drag=True to perform a drag-and-drop operation from current position to target coordinates.",
     annotations=ToolAnnotations(
         title="Move",
         readOnlyHint=False,
@@ -383,9 +396,11 @@ async def scroll_tool(
         openWorldHint=False,
     ),
 )
-async def move_tool(loc: list[int], drag: bool = False, ctx: Context = None) -> str:
-    if len(loc) != 2:
-        raise ValueError("loc must be a list of exactly 2 integers [x, y]")
+async def move_tool(loc: list[int] = None, drag: bool = False, ref: str | None = None, ctx: Context = None) -> str:
+    if ref:
+        loc = list(await desktop.async_ref_center(ref))
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref='@eN' or loc as exactly 2 integers [x, y]")
     x, y = loc[0], loc[1]
     if drag:
         await desktop.async_drag((x, y))
@@ -425,6 +440,72 @@ async def shortcut_tool(shortcut: str, ctx: Context = None):
 async def wait_tool(duration: int, ctx: Context = None) -> str:
     await desktop.async_wait(duration)
     return f"Waited for {duration} seconds."
+
+
+@mcp.tool(
+    name="Act",
+    description="Perform a semantic AX action on a Snapshot element ref — e.g. AXPress, AXShowMenu, AXIncrement, AXConfirm. Ref-only (no coordinates): the action is performed on the accessibility element itself. Errors list the actions the element actually advertises.",
+    annotations=ToolAnnotations(
+        title="Act",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def act_tool(
+    ref: str,
+    action: str = "AXPress",
+    ctx: Context = None,
+) -> str:
+    return await desktop.async_act(ref, action)
+
+
+@mcp.tool(
+    name="FindElements",
+    description="Live-search the accessibility tree of an app (frontmost by default) by role and/or name substring. Each hit is registered as a fresh @eN ref usable by Click/Type/Act/Scroll/Move. Examples: role='AXButton', name='Save'.",
+    annotations=ToolAnnotations(
+        title="FindElements",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def find_elements_tool(
+    role: str = "",
+    name: str = "",
+    pid: int = 0,
+    limit: int = 20,
+    ctx: Context = None,
+) -> str:
+    hits = await desktop.async_find_elements(role, name, pid, limit)
+    if not hits:
+        return "No elements found."
+    lines = [f"{h['ref']} {h['role']} \"{h['name']}\" {h['bbox']}" for h in hits]
+    return f"{len(hits)} elements:\n" + "\n".join(lines)
+
+
+@mcp.tool(
+    name="WaitFor",
+    description="Wait until a Snapshot ref resolves again (UI re-rendered) or until an element matching role/name appears in the frontmost app. Returns the resolved @eN ref.",
+    annotations=ToolAnnotations(
+        title="WaitFor",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def wait_for_tool(
+    ref: str = "",
+    role: str = "",
+    name: str = "",
+    timeout: float = 10.0,
+    ctx: Context = None,
+) -> str:
+    hit = await desktop.async_wait_for(ref, role, name, timeout)
+    return f"resolved {hit['ref']} {hit.get('role', '')} \"{hit.get('name', '')}\""
 
 
 _SCRAPE_MAX_CHARS = 20_000
