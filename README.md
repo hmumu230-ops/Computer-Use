@@ -1,6 +1,15 @@
 [![MCP Toplist](https://mcptoplist.com/badge/glama%2FCursorTouch%2FMacOS-MCP.svg)](https://mcptoplist.com/server/glama%2FCursorTouch%2FMacOS-MCP)
 
 <!-- mcp-name: io.github.Jeomon/macos-mcp -->
+
+> **Enhanced fork** (branch `enhanced`): adds generation-scoped `@eN`/`@wN`
+> element & window refs, pattern-first AX actions, `Act`/`FindElements`/
+> `WaitFor`, Vision OCR (`FindText`), clipboard text/image/file payloads,
+> a system toolkit (`System`/`Process`/`Service`), a confirm-token safety
+> gate (`MACOS_MCP_REQUIRE_CONFIRM`), structured errors, and a direct CLI
+> (`macos-mcp doctor|tools|call`). Upstream: [Jeomon/macos-mcp](https://github.com/Jeomon/macos-mcp).
+> See `docs/ACCEPTANCE.md` + `docs/TESTING.md` for verification status.
+
 <div align="center">
   <h1>🍎 macOS-MCP</h1>
 
