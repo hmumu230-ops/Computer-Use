@@ -46,16 +46,35 @@ The project is organized into modular services:
 
 | Tool | Purpose |
 |------|---------|
-| `Click` | Click at coordinates (left/right/double) |
-| `Type` | Type text, optionally clearing existing text |
-| `Scroll` | Scroll vertically or horizontally |
-| `Move` | Move or drag mouse pointer |
+| `Click` | Click at coordinates or `ref='@eN'` (semantic AXPress first, coords fallback) |
+| `Type` | Type text at coordinates or into a `ref` element (focus + AXValue when settable) |
+| `Scroll` | Scroll vertically or horizontally, at coords or a `ref` element's centre |
+| `Move` | Move or drag mouse pointer to coords or a `ref` element's centre |
+| `Act` | Perform a semantic AX action on a `ref` (AXPress/AXShowMenu/AXIncrement…) — no coordinates |
+| `FindElements` | Live-search the accessibility tree by role/name; hits mint fresh `@eN` refs |
+| `WaitFor` | Poll until a ref resolves again or a role/name match appears |
 | `Shortcut` | Press keyboard shortcuts (Cmd+C, etc.) |
 | `Wait` | Pause execution for defined duration |
-| `Snapshot` | Capture desktop state with optional visual annotations |
+| `Snapshot` | Capture desktop state with optional visual annotations; mints `@eN`/`@wN` refs |
 | `App` | Launch/manage applications |
-| `Shell` | Execute shell commands or AppleScript |
+| `Shell` | Execute shell commands or AppleScript (confirm-token gate via `MACOS_MCP_REQUIRE_CONFIRM`) |
 | `Scrape` | Extract and convert webpage content to Markdown |
+
+### Enhanced-fork additions (branch `enhanced`)
+
+- **Persistent refs**: `Snapshot` mints `@eN` element refs and `@wN` window refs, scoped to a
+  capture generation — refs from an older Snapshot are stale. Resolution ladder at action
+  time: live element probe → runtime re-search by `(pid, role, name, nth)` → `StaleRef`.
+- **Pattern-first input**: ref-based actions prefer AX verbs (`AXPress`, `AXShowMenu`,
+  settable `AXValue`/`AXFocused`) before synthetic coordinate input.
+- **Structured errors**: `macos_mcp/errors.py` `{code, message, hint, retryable}` — e.g.
+  `STALE_REF`, `CONFIRM_REQUIRED`, `PERMISSION_REQUIRED`.
+- **Safety gate**: `macos_mcp/safety.py` — single-use confirm tokens bound to the action
+  digest, 120 s TTL, enabled via `MACOS_MCP_REQUIRE_CONFIRM` (`1`, or comma-separated
+  action prefixes like `shell`).
+- Core modules `errors.py`, `refs.py`, `safety.py` are PyObjC-free and unit-testable on
+  any platform; tests/conftest.py skips PyObjC-dependent test files when the frameworks
+  are absent.
 
 ## Development Guidelines
 
