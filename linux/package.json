@@ -1,0 +1,73 @@
+{
+  "name": "@tak1tak/linux-computer-use",
+  "version": "0.2.0",
+  "description": "Linux computer-use tools for Pi (mariozechner/pi-coding-agent): AT-SPI refs, X11 + Wayland (portal/wlroots/uinput) input, compositor-routed window management, OCR, clipboard, system toolkit.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "computer-use",
+    "linux",
+    "x11",
+    "wayland",
+    "at-spi",
+    "automation",
+    "agent",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "Tak1tak <https://bytak.in>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tak-uukti/linux-computer-use.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tak-uukti/linux-computer-use/issues"
+  },
+  "homepage": "https://github.com/tak-uukti/linux-computer-use#readme",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "src",
+    "scripts/setup-helper.mjs",
+    "bridge/",
+    "assets/logo.png",
+    "assets/logo.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "image": "./assets/logo.png"
+  },
+  "scripts": {
+    "postinstall": "node scripts/setup-helper.mjs --postinstall",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    },
+    "@sinclair/typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.4",
+    "@types/node": "^20.11.0"
+  }
+}
