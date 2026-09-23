@@ -1,0 +1,1462 @@
+"""
+macOS-MCP: MCP Server for macOS Desktop Interaction.
+
+Provides tools to interact with the macOS desktop for automation.
+"""
+
+from macos_mcp.desktop.service import Desktop
+from macos_mcp.desktop.views import Size
+from macos_mcp import safety, system as syskit
+from macos_mcp.watchdog import WatchDog
+from macos_mcp.permissions import validate_permissions
+from macos_mcp.infrastructure import (
+    AuthKeyMiddleware,
+    OAuthOnlyMiddleware,
+    IPAllowlistMiddleware,
+    PostHogAnalytics,
+    Analytics,
+    is_loopback_host,
+    parse_ip_allowlist,
+    validate_url,
+    CONFIG_DIR,
+    CONFIG_FILE,
+    MacOSMCPConfig,
+    discover_config_path,
+    load_config,
+    write_config,
+    OAuthStore,
+    build_oauth_routes,
+    validate_oauth_token,
+)
+from contextlib import asynccontextmanager
+from fastmcp.utilities.types import Image
+from mcp.types import ToolAnnotations
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from typing import Any, Literal, Optional
+from fastmcp import FastMCP, Context
+from textwrap import dedent
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+import plistlib
+import secrets
+import shutil
+import socket
+import signal
+import subprocess
+import sys
+from threading import Lock
+import click
+
+logger = logging.getLogger(__name__)
+
+desktop: Optional[Desktop] = None
+screen_size: Optional[Size] = None
+watchdog: Optional[WatchDog] = None
+analytics: Optional[Analytics] = None
+_shutdown_lock = Lock()
+_shutdown_started = False
+
+MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT = 1920, 1080
+
+instructions = dedent("""
+macOS MCP server provides tools to interact directly with the macOS desktop, 
+enabling operation of the desktop on the user's behalf.
+""")
+
+
+def _stop_watchdog() -> None:
+    """Stop the watchdog once, even if shutdown paths race."""
+    global watchdog, _shutdown_started
+
+    with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
+
+    if watchdog:
+        try:
+            if watchdog.is_running:
+                watchdog.stop()
+        except Exception:
+            logger.debug(
+                "Failed to stop watchdog during shutdown (may have already crashed)"
+            )
+        finally:
+            watchdog = None
+
+
+def _force_exit(exit_code: int = 130) -> None:
+    """Flush stdio and exit immediately to avoid daemon-thread shutdown hangs."""
+    _stop_watchdog()
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+
+    os._exit(exit_code)
+
+
+class OptionsMiddleware:
+    """ASGI middleware that intercepts OPTIONS requests and returns 200 OK."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["method"] == "OPTIONS":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        [b"content-length", b"0"],
+                        [b"access-control-allow-origin", b"*"],
+                        [b"access-control-allow-methods", b"*"],
+                        [b"access-control-allow-headers", b"*"],
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+        else:
+            await self.app(scope, receive, send)
+
+
+def _http_middleware(
+    auth_key: str | None = None,
+    ip_allowlist: list | None = None,
+    oauth_validator=None,
+) -> list:
+    """Return ASGI middleware for HTTP transports including CORS and OPTIONS handling."""
+    middleware = [
+        Middleware(OptionsMiddleware),
+        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+    ]
+    if ip_allowlist:
+        middleware.append(Middleware(IPAllowlistMiddleware, allowlist=ip_allowlist))
+    if auth_key:
+        middleware.append(Middleware(AuthKeyMiddleware, auth_key=auth_key, oauth_validator=oauth_validator))
+    elif oauth_validator:
+        middleware.append(Middleware(OAuthOnlyMiddleware, oauth_validator=oauth_validator))
+    return middleware
+
+
+@asynccontextmanager
+async def lifespan(app: FastMCP):
+    """Runs initialization code before the server starts and cleanup code after it shuts down."""
+    global desktop, screen_size, watchdog, analytics, _shutdown_started
+
+    if os.getenv("ANONYMIZED_TELEMETRY", "true").lower() != "false":
+        analytics = PostHogAnalytics()
+
+    desktop = Desktop()
+    screen_size = desktop.get_screen_size()
+    _shutdown_started = False
+
+    watchdog = WatchDog()
+    watchdog.set_focus_callback(desktop.tree.on_focus_changed)
+    try:
+        watchdog.start()
+    except Exception as e:
+        logger.warning(
+            f"Watchdog failed to start (non-fatal): {e}. Continuing without event monitoring."
+        )
+
+    try:
+        await asyncio.sleep(0.5)  # Brief startup delay
+        yield
+    finally:
+        _stop_watchdog()
+        if analytics:
+            await analytics.close()
+
+
+mcp = FastMCP(name="macos-mcp", instructions=instructions, lifespan=lifespan)
+
+
+@mcp.tool(
+    name="App",
+    description="Manages macOS applications with four modes: 'launch' (opens the application), 'resize' (adjusts active window size), 'move' (repositions active window), 'switch' (brings specific app into focus).",
+    annotations=ToolAnnotations(
+        title="App",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def app_tool(
+    mode: Literal["launch", "resize", "move", "switch"] = "launch",
+    name: str | None = None,
+    window_loc: list[int] | None = None,
+    window_size: list[int] | None = None,
+    ctx: Context = None,
+):
+    return await desktop.async_app(
+        mode,
+        name,
+        tuple(window_loc) if window_loc else None,
+        tuple(window_size) if window_size else None,
+    )
+
+
+@mcp.tool(
+    name="Shell",
+    description="Execute commands on macOS. Modes: 'shell' (default) for bash/zsh commands, 'osascript' for AppleScript. Use for file system, process management, system operations, and automation scripts. SECURITY WARNING: Commands are executed with the same permissions as the terminal/application running this server. Review and understand all actions before execution, especially those involving file operations, system modifications, or external processes.",
+    annotations=ToolAnnotations(
+        title="Shell",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+async def shell_tool(
+    command: str,
+    mode: Literal["shell", "osascript"] = "shell",
+    timeout: int = 10,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    safety.gate("shell:exec", {"command": command, "mode": mode},
+                dangerous=False, token=confirmToken)
+    response, status_code = await desktop.async_execute_command(command, mode=mode, timeout=timeout)
+    mode_label = "AppleScript" if mode == "osascript" else "Shell"
+    return f"{mode_label} Response: {response}\nStatus Code: {status_code}"
+
+
+@mcp.tool(
+    name="Snapshot",
+    description="Captures complete desktop state including: focused window, open applications, interactive elements (buttons, text fields, links, menus with coordinates), and scrollable areas. Set use_vision=True to include screenshot with numbered annotations on interactive elements. Always call this first to understand the current desktop state before taking actions.",
+    annotations=ToolAnnotations(
+        title="Snapshot",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def state_tool(use_vision: bool = False, ctx: Context = None):
+    # Calculate scale factor to cap resolution at 1080p
+    scale = 1.0
+    if screen_size and screen_size.width > 0 and screen_size.height > 0:
+        scale_width = (
+            MAX_IMAGE_WIDTH / screen_size.width
+            if screen_size.width > MAX_IMAGE_WIDTH
+            else 1.0
+        )
+        scale_height = (
+            MAX_IMAGE_HEIGHT / screen_size.height
+            if screen_size.height > MAX_IMAGE_HEIGHT
+            else 1.0
+        )
+        scale = min(scale_width, scale_height)
+
+    desktop_state = await desktop.async_get_state(use_vision=use_vision, as_bytes=True, scale=scale)
+    interactive_elements = desktop_state.tree_state.interactive_elements_to_string()
+    scrollable_elements = desktop_state.tree_state.scrollable_elements_to_string()
+    windows = desktop_state.windows_to_string()
+    active_window = desktop_state.active_window_to_string()
+
+    snapshot = dedent(f"""
+    Focused Window:
+    {active_window}
+
+    Open Applications:
+    {windows}
+
+    List of Interactive Elements:
+    {interactive_elements or "No interactive elements found."}
+
+    List of Scrollable Elements:
+    {scrollable_elements or "No scrollable elements found."}
+    """)
+
+    if use_vision and not desktop_state.screenshot:
+        # Screen capture fails transiently (display sleep/lock, monitor hot-plug).
+        # Say so rather than returning a text-only snapshot that looks complete.
+        snapshot += dedent("""
+    Note: Screenshot capture failed, so no annotated image is attached. The elements
+    listed above are still valid; call Snapshot again if you need the screenshot.
+    """)
+
+    return [snapshot] + (
+        [Image(data=desktop_state.screenshot, format="png")]
+        if use_vision and desktop_state.screenshot
+        else []
+    )
+
+
+@mcp.tool(
+    name="Click",
+    description="Performs mouse clicks — pass ref='@eN' for a Snapshot element (tries its AX action first, falls back to coordinates) or loc=[x, y] for raw coordinates. Supports button types: 'left' for selection/activation, 'right' for context menus, 'middle'. Supports clicks: 0=hover only, 1=single click, 2=double click.",
+    annotations=ToolAnnotations(
+        title="Click",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def click_tool(
+    loc: list[int] | None = None,
+    button: Literal["left", "right", "middle"] = "left",
+    clicks: int = 1,
+    ref: str | None = None,
+    ctx: Context = None,
+) -> str:
+    if ref:
+        return await desktop.async_click_ref(ref, button, clicks)
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref='@eN' or loc as exactly 2 integers [x, y]")
+    x, y = loc[0], loc[1]
+    await desktop.async_click(loc=(x, y), button=button, clicks=clicks)
+    num_clicks = {0: "Hover", 1: "Single", 2: "Double"}
+    return f"{num_clicks.get(clicks)} {button} clicked at ({x},{y})."
+
+
+@mcp.tool(
+    name="Type",
+    description="Types text — pass ref='@eN' to target a Snapshot element (focuses it, sets AXValue when settable, else clicks + types) or loc=[x, y] for coordinates. Set clear=True to clear existing text first. Set press_enter=True to submit after typing. Set caret_position to 'start', 'end', or 'idle' (default).",
+    annotations=ToolAnnotations(
+        title="Type",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def type_tool(
+    loc: list[int] | None = None,
+    text: str = "",
+    clear: bool = False,
+    caret_position: Literal["start", "idle", "end"] = "idle",
+    press_enter: bool = False,
+    ref: str | None = None,
+    ctx: Context = None,
+) -> str:
+    if ref:
+        return await desktop.async_type_ref(ref, text, clear, press_enter)
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref='@eN' or loc as exactly 2 integers [x, y]")
+    x, y = loc[0], loc[1]
+    await desktop.async_type(
+        loc=(x, y),
+        text=text,
+        caret_position=caret_position,
+        clear=clear,
+        press_enter=press_enter,
+    )
+    return f"Typed {text} at ({x},{y})."
+
+
+@mcp.tool(
+    name="Scroll",
+    description="Scrolls at ref='@eN' (element center), coordinates [x, y], or current mouse position if neither is given. Type: vertical (default) or horizontal. Direction: up/down for vertical, left/right for horizontal. wheel_times controls scroll amount.",
+    annotations=ToolAnnotations(
+        title="Scroll",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def scroll_tool(
+    loc: list[int] = None,
+    type: Literal["horizontal", "vertical"] = "vertical",
+    direction: Literal["up", "down", "left", "right"] = "down",
+    wheel_times: int = 1,
+    ref: str | None = None,
+    ctx: Context = None,
+) -> str:
+    if ref:
+        loc = list(await desktop.async_ref_center(ref))
+    if loc and len(loc) != 2:
+        raise ValueError("Location must be a list of exactly 2 integers [x, y]")
+    response = await desktop.async_scroll(tuple(loc) if loc else None, type, direction, wheel_times)
+    if response:
+        return response
+    return f"Scrolled {type} {direction} by {wheel_times} wheel times" + (
+        f" at ({loc[0]},{loc[1]})." if loc else "."
+    )
+
+
+@mcp.tool(
+    name="Move",
+    description="Moves mouse cursor to ref='@eN' (element center) or coordinates [x, y]. Set drag=True to perform a drag-and-drop operation from current position to target coordinates.",
+    annotations=ToolAnnotations(
+        title="Move",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def move_tool(loc: list[int] = None, drag: bool = False, ref: str | None = None, ctx: Context = None) -> str:
+    if ref:
+        loc = list(await desktop.async_ref_center(ref))
+    if loc is None or len(loc) != 2:
+        raise ValueError("Provide ref='@eN' or loc as exactly 2 integers [x, y]")
+    x, y = loc[0], loc[1]
+    if drag:
+        await desktop.async_drag((x, y))
+        return f"Dragged to ({x},{y})."
+    else:
+        await desktop.async_move((x, y))
+        return f"Moved the mouse pointer to ({x},{y})."
+
+
+@mcp.tool(
+    name="Shortcut",
+    description='Executes keyboard shortcuts using key combinations separated by +. Examples: "command+c" (copy), "command+v" (paste), "command+tab" (switch apps), "command+space" (Spotlight). Note: Use "command" instead of "ctrl" on macOS.',
+    annotations=ToolAnnotations(
+        title="Shortcut",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def shortcut_tool(shortcut: str, ctx: Context = None):
+    await desktop.async_shortcut(shortcut)
+    return f"Pressed {shortcut}."
+
+
+@mcp.tool(
+    name="Wait",
+    description="Pauses execution for specified duration in seconds. Use when waiting for: applications to launch, UI animations to complete, content to load. Helps ensure UI is ready before next interaction.",
+    annotations=ToolAnnotations(
+        title="Wait",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def wait_tool(duration: int, ctx: Context = None) -> str:
+    await desktop.async_wait(duration)
+    return f"Waited for {duration} seconds."
+
+
+@mcp.tool(
+    name="Act",
+    description="Perform a semantic AX action on a Snapshot element ref — e.g. AXPress, AXShowMenu, AXIncrement, AXConfirm. Ref-only (no coordinates): the action is performed on the accessibility element itself. Errors list the actions the element actually advertises.",
+    annotations=ToolAnnotations(
+        title="Act",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def act_tool(
+    ref: str,
+    action: str = "AXPress",
+    ctx: Context = None,
+) -> str:
+    return await desktop.async_act(ref, action)
+
+
+@mcp.tool(
+    name="FindElements",
+    description="Live-search the accessibility tree of an app (frontmost by default) by role and/or name substring. Each hit is registered as a fresh @eN ref usable by Click/Type/Act/Scroll/Move. Examples: role='AXButton', name='Save'.",
+    annotations=ToolAnnotations(
+        title="FindElements",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def find_elements_tool(
+    role: str = "",
+    name: str = "",
+    pid: int = 0,
+    limit: int = 20,
+    ctx: Context = None,
+) -> str:
+    hits = await desktop.async_find_elements(role, name, pid, limit)
+    if not hits:
+        return "No elements found."
+    lines = [f"{h['ref']} {h['role']} \"{h['name']}\" {h['bbox']}" for h in hits]
+    return f"{len(hits)} elements:\n" + "\n".join(lines)
+
+
+@mcp.tool(
+    name="WaitFor",
+    description="Wait until a Snapshot ref resolves again (UI re-rendered) or until an element matching role/name appears in the frontmost app. Returns the resolved @eN ref.",
+    annotations=ToolAnnotations(
+        title="WaitFor",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def wait_for_tool(
+    ref: str = "",
+    role: str = "",
+    name: str = "",
+    timeout: float = 10.0,
+    ctx: Context = None,
+) -> str:
+    hit = await desktop.async_wait_for(ref, role, name, timeout)
+    return f"resolved {hit['ref']} {hit.get('role', '')} \"{hit.get('name', '')}\""
+
+
+@mcp.tool(
+    name="Clipboard",
+    description="Read or write the macOS clipboard. mode='get' reads: 'text' returns text, 'image' returns base64 PNG (or empty), 'files' returns file paths. mode='set' writes: pass text=..., image=base64 PNG, or files=[paths].",
+    annotations=ToolAnnotations(
+        title="Clipboard",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def clipboard_tool(
+    mode: Literal["get", "set"] = "get",
+    what: Literal["text", "image", "files"] = "text",
+    text: str = "",
+    image: str = "",
+    files: list[str] | None = None,
+    ctx: Context = None,
+) -> str:
+    import base64
+    image_png = base64.b64decode(image) if image else None
+    result = await desktop.async_clipboard(
+        what, text, image_png, files, mode == "get"
+    )
+    if mode == "get" and what == "image":
+        data = result.get("image_png")
+        return base64.b64encode(data).decode() if data else ""
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool(
+    name="FindText",
+    description="OCR the screen with the native Vision framework and return every visible occurrence of `text` as a clickable @eN ref. Use as a fallback when Snapshot's accessibility tree misses something (canvas apps, Electron, images).",
+    annotations=ToolAnnotations(
+        title="FindText",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def find_text_tool(
+    text: str,
+    case_sensitive: bool = False,
+    ctx: Context = None,
+) -> str:
+    hits = await desktop.async_find_text(text, case_sensitive, None)
+    if not hits:
+        return f"No on-screen text matching '{text}'."
+    lines = [
+        f"{h['ref']} \"{h['text']}\" ({h['bbox']['x']},{h['bbox']['y']},"
+        f"{h['bbox']['w']}x{h['bbox']['h']}) conf={h['confidence']:.2f}"
+        for h in hits
+    ]
+    return f"{len(hits)} match(es):\n" + "\n".join(lines)
+
+
+_SYSTEM_DOMAINS = {
+    "probe": (syskit.probe, False),
+    "identity": (syskit.identity, False),
+    "power_status": (syskit.power_status, False),
+    "display": (syskit.display_list, False),
+    "device": (syskit.device_list, False),
+    "network": (syskit.network_status, False),
+    "audio_get": (syskit.audio_get, False),
+    "env_list": (syskit.env_list, False),
+    "log": (syskit.log_query, False),
+    "audio_set": (syskit.audio_set, False),
+    "audio_mute": (syskit.audio_mute, False),
+    "env_set": (syskit.env_set, True),
+    "power": (syskit.power_action, True),
+    "wifi": (syskit.network_wifi, True),
+}
+
+
+@mcp.tool(
+    name="System",
+    description=(
+        "macOS system information and control. Read domains: probe, identity, "
+        "power_status, display, device(kind=hardware|usb|bluetooth|storage), "
+        "network, audio_get, env_list, log(predicate,last,limit). "
+        "Write domains (confirmToken-gated when MACOS_MCP_REQUIRE_CONFIRM is "
+        "set): audio_set(volume), audio_mute(muted), env_set(name,value), "
+        "power(action=sleep|caffeinate), wifi(power=on|off)."
+    ),
+    annotations=ToolAnnotations(
+        title="System",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def system_tool(
+    domain: str,
+    args: dict | None = None,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    entry = _SYSTEM_DOMAINS.get(domain)
+    if entry is None:
+        raise ValueError(
+            f"unknown domain '{domain}'. available: "
+            + ", ".join(sorted(_SYSTEM_DOMAINS)))
+    fn, dangerous = entry
+    safety.gate(f"system:{domain}", args or {}, dangerous, confirmToken)
+    result = await asyncio.to_thread(fn, **(args or {}))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool(
+    name="Process",
+    description="List processes (name filter) or kill by pid. mode='list' returns pid/comm/cpu/mem/args; mode='kill' sends a signal (TERM default) — gated by confirm token when MACOS_MCP_REQUIRE_CONFIRM is set.",
+    annotations=ToolAnnotations(
+        title="Process",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def process_tool(
+    mode: Literal["list", "kill"] = "list",
+    name: str = "",
+    pid: int = 0,
+    signal: str = "TERM",
+    limit: int = 50,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    if mode == "list":
+        rows = await asyncio.to_thread(syskit.process_list, name, limit)
+        return json.dumps(rows, ensure_ascii=False)
+    safety.gate("process:kill", {"pid": pid, "signal": signal},
+                dangerous=True, token=confirmToken)
+    return await asyncio.to_thread(syskit.process_kill, pid, signal)
+
+
+@mcp.tool(
+    name="Service",
+    description="launchd service management. mode='list' lists services (filter substring); mode='control' runs action=kickstart|enable|disable|bootout on a label in the gui domain — gated by confirm token when MACOS_MCP_REQUIRE_CONFIRM is set.",
+    annotations=ToolAnnotations(
+        title="Service",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def service_tool(
+    mode: Literal["list", "control"] = "list",
+    filter: str = "",
+    label: str = "",
+    action: str = "kickstart",
+    domain: str = "gui",
+    limit: int = 50,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    if mode == "list":
+        rows = await asyncio.to_thread(syskit.service_list, filter, limit)
+        return json.dumps(rows, ensure_ascii=False)
+    safety.gate("service:control", {"label": label, "action": action},
+                dangerous=True, token=confirmToken)
+    return await asyncio.to_thread(
+        syskit.service_control, action, label, domain)
+
+
+_SCRAPE_MAX_CHARS = 20_000
+
+
+@mcp.tool(
+    name="Scrape",
+    description="Fetch content from a URL. Performs a lightweight HTTP request and returns the page content as text.",
+    annotations=ToolAnnotations(
+        title="Scrape",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def scrape_tool(url: str, ctx: Context = None) -> str:
+    validate_url(url)
+    content = await desktop.async_scrape(url)
+    if len(content) > _SCRAPE_MAX_CHARS:
+        content = content[:_SCRAPE_MAX_CHARS] + f"\n\n...[truncated — {len(content) - _SCRAPE_MAX_CHARS} chars omitted. Scroll the page and scrape again to read more.]"
+    return f"URL:{url}\nContent:\n{content}"
+
+
+@mcp.tool(
+    name="Desktop",
+    description=(
+        "Manages Mission Control desktop Spaces. "
+        "mode='create' opens Mission Control and clicks 'Add Desktop' to create a new virtual desktop, "
+        "verifying the space count increased before reporting success. "
+        "Uses Accessibility only. "
+        "Requires Accessibility permission. UI layout can vary by macOS version/locale."
+    ),
+    annotations=ToolAnnotations(
+        title="Desktop",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def desktop_tool(
+    mode: Literal["create"] = "create",
+    close_after: bool = True,
+    open_delay: float = 0.9,
+    ctx: Context = None,
+) -> str:
+    if mode != "create":
+        return f"Unknown mode: {mode}. Supported modes: create."
+    return await desktop.async_create_desktop_space(
+        open_delay=open_delay,
+        close_after=close_after,
+    )
+
+
+@mcp.tool(
+    name="Notification",
+    description="Sends a macOS notification banner with a message, title, optional subtitle, and optional sound.",
+    annotations=ToolAnnotations(
+        title="Notification",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def notification_tool(
+    message: str,
+    title: str = "Notification",
+    subtitle: str | None = None,
+    sound: Literal[
+        "Glass",
+        "Ping",
+        "Basso",
+        "Tink",
+        "Funk",
+        "Bottle",
+        "Frog",
+        "Hero",
+        "Morse",
+        "Pop",
+        "Purr",
+        "Sosumi",
+        "Submarine",
+    ]
+    | None = None,
+    ctx: Context = None,
+) -> str:
+    return await desktop.async_notify(message, title, subtitle, sound)
+
+
+def _param_explicit(ctx: click.Context, name: str) -> bool:
+    src = ctx.get_parameter_source(name)
+    return getattr(src, "name", None) in {"COMMANDLINE", "ENVIRONMENT"}
+
+
+def _choose_value(ctx: click.Context, name: str, cli_value, config_value, default_value):
+    if _param_explicit(ctx, name):
+        return cli_value
+    if config_value is not None:
+        return config_value
+    return default_value
+
+
+@click.group()
+def main():
+    """macOS-MCP: MCP server for macOS desktop automation."""
+
+
+@main.command()
+@click.pass_context
+@click.option(
+    "--transport",
+    help="The transport layer used by the MCP server.",
+    type=click.Choice(["stdio", "sse", "streamable-http"]),
+    default="stdio",
+)
+@click.option(
+    "--host",
+    help="Host to bind the SSE/Streamable HTTP server.",
+    default="127.0.0.1",
+    type=str,
+    show_default=True,
+)
+@click.option(
+    "--port",
+    help="Port to bind the SSE/Streamable HTTP server.",
+    default=8000,
+    type=int,
+    show_default=True,
+)
+@click.option(
+    "--debug",
+    help="Enable debug mode to provide verbose logging for troubleshooting.",
+    is_flag=True,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--config",
+    help="Path to macos-mcp.toml config file.",
+    default=None,
+    type=click.Path(dir_okay=False),
+    show_default=False,
+)
+@click.option(
+    "--auth-key",
+    help="Bearer token required on all HTTP requests. Can also be set via MACOS_MCP_AUTH_KEY.",
+    default=None,
+    envvar="MACOS_MCP_AUTH_KEY",
+    type=str,
+    show_default=False,
+)
+@click.option(
+    "--allow-insecure-remote",
+    help="Allow binding to non-loopback addresses without authentication (not recommended).",
+    is_flag=True,
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--ip-allowlist",
+    help="Comma-separated list of allowed client IPs or CIDR ranges (e.g. '10.0.0.0/8,192.168.1.5'). IPv4 and IPv6 supported.",
+    default=None,
+    envvar="MACOS_MCP_IP_ALLOWLIST",
+    type=str,
+    show_default=False,
+)
+@click.option(
+    "--ssl-certfile",
+    help="Path to TLS certificate file (.pem) for HTTPS. Requires --ssl-keyfile.",
+    default=None,
+    envvar="MACOS_MCP_SSL_CERTFILE",
+    type=str,
+    show_default=False,
+)
+@click.option(
+    "--ssl-keyfile",
+    help="Path to TLS private key file (.pem) for HTTPS. Requires --ssl-certfile.",
+    default=None,
+    envvar="MACOS_MCP_SSL_KEYFILE",
+    type=str,
+    show_default=False,
+)
+@click.option(
+    "--oauth-client-id",
+    help="OAuth client ID (pre-provisioned confidential client). Requires --oauth-client-secret.",
+    default=None,
+    envvar="MACOS_MCP_OAUTH_CLIENT_ID",
+    type=str,
+    show_default=False,
+)
+@click.option(
+    "--oauth-client-secret",
+    help="OAuth client secret. Requires --oauth-client-id.",
+    default=None,
+    envvar="MACOS_MCP_OAUTH_CLIENT_SECRET",
+    type=str,
+    show_default=False,
+)
+def serve(ctx, transport, host, port, debug, config, auth_key, allow_insecure_remote, ip_allowlist, ssl_certfile, ssl_keyfile, oauth_client_id, oauth_client_secret):
+    # Validate required permissions before starting server
+    validate_permissions()
+
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        for name in ["uvicorn", "uvicorn.error", "uvicorn.access", "fastmcp"]:
+            logging.getLogger(name).setLevel(logging.DEBUG)
+
+    # Load config file and merge with CLI flags (CLI wins)
+    config_path = discover_config_path(config)
+    try:
+        cfg = load_config(config_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc))
+
+    transport = _choose_value(ctx, "transport", transport, cfg.server.transport, "stdio")
+    host = _choose_value(ctx, "host", host, cfg.server.host, "127.0.0.1")
+    port = int(_choose_value(ctx, "port", port, cfg.server.port, 8000))
+    auth_key = _choose_value(ctx, "auth_key", auth_key, cfg.server.auth_key, None)
+    allow_insecure_remote = bool(
+        _choose_value(ctx, "allow_insecure_remote", allow_insecure_remote, cfg.server.allow_insecure_remote, False)
+    )
+    ssl_certfile = _choose_value(ctx, "ssl_certfile", ssl_certfile, cfg.server.ssl_certfile, None)
+    ssl_keyfile = _choose_value(ctx, "ssl_keyfile", ssl_keyfile, cfg.server.ssl_keyfile, None)
+    oauth_client_id = _choose_value(ctx, "oauth_client_id", oauth_client_id, cfg.security.oauth_client_id, None)
+    oauth_client_secret = _choose_value(
+        ctx, "oauth_client_secret", oauth_client_secret, cfg.security.oauth_client_secret, None
+    )
+
+    cli_allowlist = [e.strip() for e in ip_allowlist.split(",")] if ip_allowlist else None
+    allowlist_entries = cli_allowlist if _param_explicit(ctx, "ip_allowlist") else cfg.security.ip_allowlist
+
+    if bool(ssl_certfile) != bool(ssl_keyfile):
+        raise click.ClickException("--ssl-certfile and --ssl-keyfile must be provided together.")
+
+    if bool(oauth_client_id) != bool(oauth_client_secret):
+        raise click.ClickException("OAuth requires both --oauth-client-id and --oauth-client-secret.")
+
+    parsed_allowlist = None
+    if allowlist_entries:
+        try:
+            parsed_allowlist = parse_ip_allowlist(allowlist_entries)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid ip_allowlist: {exc}")
+
+    configured_oauth = bool(oauth_client_id and oauth_client_secret)
+
+    if (
+        transport != "stdio"
+        and not is_loopback_host(host)
+        and not auth_key
+        and not configured_oauth
+        and not allow_insecure_remote
+    ):
+        raise click.ClickException(
+            f"Refusing to bind HTTP transport to '{host}' without authentication.\n"
+            "  Use --auth-key <token> or --oauth-client-id/--oauth-client-secret.\n"
+            "  Or pass --allow-insecure-remote to explicitly allow unauthenticated access (not recommended)."
+        )
+
+    if (auth_key or allowlist_entries) and transport == "stdio":
+        logger.warning("auth_key / ip_allowlist have no effect on stdio transport")
+
+    # Set up OAuth routes if configured (HTTP transports only)
+    oauth_validator = None
+    if configured_oauth and transport != "stdio":
+        oauth_store = OAuthStore()
+        scheme = "https" if (ssl_certfile and ssl_keyfile) else "http"
+        issuer = f"{scheme}://{host}:{port}"
+        routes = build_oauth_routes(
+            store=oauth_store,
+            issuer=issuer,
+            configured_client_id=oauth_client_id,
+            configured_client_secret=oauth_client_secret,
+        )
+        for path, (handler, methods) in routes.items():
+            mcp.custom_route(path, methods=methods)(handler)
+        oauth_validator = lambda tok: validate_oauth_token(oauth_store, tok)  # noqa: E731
+
+    for tool_name in cfg.tools.exclude:
+        try:
+            mcp.remove_tool(tool_name)
+            logger.debug(f"Excluded tool: {tool_name}")
+        except Exception:
+            logger.warning(f"Could not exclude tool '{tool_name}' — not found")
+
+    previous_sigint_handler = None
+
+    if transport == "stdio":
+        previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+        def _handle_sigint(signum, frame):
+            _force_exit(130)
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+
+    match transport:
+        case "stdio":
+            try:
+                mcp.run(transport=transport, show_banner=False)
+            except (KeyboardInterrupt, click.Abort):
+                _force_exit(130)
+            finally:
+                if previous_sigint_handler is not None:
+                    signal.signal(signal.SIGINT, previous_sigint_handler)
+        case "sse" | "streamable-http":
+            # FastMCP 2.14.4 sets Uvicorn's graceful-shutdown timeout to zero,
+            # which emits a timeout error even when no requests are active.
+            # Use FastMCP 3.x's two-second default to keep shutdown bounded and quiet.
+            uvicorn_config: dict = {"timeout_graceful_shutdown": 2}
+            if ssl_certfile and ssl_keyfile:
+                uvicorn_config["ssl_certfile"] = ssl_certfile
+                uvicorn_config["ssl_keyfile"] = ssl_keyfile
+            mcp.run(
+                transport=transport,
+                host=host,
+                port=port,
+                show_banner=False,
+                middleware=_http_middleware(auth_key=auth_key, ip_allowlist=parsed_allowlist, oauth_validator=oauth_validator),
+                uvicorn_config=uvicorn_config or None,
+                # No tools need per-client HTTP session state; avoid retaining
+                # abandoned SDK transports when clients reconnect without DELETE.
+                stateless_http=transport == "streamable-http",
+            )
+        case _:
+            raise ValueError(f"Invalid transport: {transport}")
+
+
+def _gen_tls(host: str, cert_path, key_path) -> None:
+    """Generate a TLS cert/key pair, preferring mkcert over openssl."""
+    cert_path = Path(cert_path)
+    key_path = Path(key_path)
+
+    mkcert = subprocess.run(["which", "mkcert"], capture_output=True).returncode == 0
+
+    if mkcert:
+        click.echo("mkcert detected — generating a locally-trusted certificate...")
+        install = subprocess.run(["mkcert", "-install"], capture_output=True, text=True)
+        if install.returncode != 0:
+            raise click.ClickException(f"mkcert -install failed:\n{install.stderr.strip()}")
+
+        # mkcert needs the host name/IP; use localhost as extra SAN when binding 0.0.0.0
+        sans = [host] if host not in ("0.0.0.0", "") else ["localhost", "127.0.0.1", "::1"]
+        result = subprocess.run(
+            [
+                "mkcert",
+                "-cert-file", str(cert_path),
+                "-key-file", str(key_path),
+                *sans,
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise click.ClickException(f"mkcert failed:\n{result.stderr.strip()}")
+        click.echo("  Certificate is automatically trusted by macOS.")
+    else:
+        click.echo("mkcert not found — falling back to openssl (self-signed)...")
+        click.echo("  Tip: brew install mkcert  for auto-trusted certs next time.")
+        result = subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:4096",
+                "-keyout", str(key_path),
+                "-out", str(cert_path),
+                "-days", "365", "-nodes",
+                "-subj", f"/CN={host or 'macos-mcp'}",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise click.ClickException(f"openssl failed:\n{result.stderr.strip()}")
+        click.echo("  To make macOS trust this cert, run:")
+        click.echo(f"    sudo security add-trusted-cert -d -r trustRoot \\")
+        click.echo(f"      -k /Library/Keychains/System.keychain {cert_path}")
+
+    click.echo(f"  cert → {cert_path}")
+    click.echo(f"  key  → {key_path}")
+
+
+@main.command()
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "sse", "streamable-http"]),
+    default="sse",
+    show_default=True,
+    help="Transport mode to configure. Saves the choice to config.toml.",
+)
+@click.option(
+    "--host",
+    default="0.0.0.0",
+    show_default=True,
+    help="Host to bind the server to.",
+)
+@click.option(
+    "--port",
+    default=8000,
+    show_default=True,
+    type=int,
+    help="Port to bind the server to.",
+)
+@click.option("--with-tls", is_flag=True, help="Generate a self-signed TLS certificate and key.")
+@click.option("--force", is_flag=True, help="Overwrite existing credentials without prompting.")
+def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> None:
+    """Generate an auth key (and optionally TLS certs) and save to ~/.macos-mcp/config.toml."""
+    config_path = CONFIG_FILE
+
+    cfg = load_config(config_path) if config_path.exists() else MacOSMCPConfig()
+
+    if cfg.server.auth_key and not force:
+        click.echo(f"Auth key already set in {config_path}. Use --force to regenerate.")
+        return
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    new_key = secrets.token_urlsafe(32)
+    cfg.server.auth_key = new_key
+    cfg.server.transport = transport
+    cfg.server.host = host
+    cfg.server.port = port
+    click.echo(f"Generated auth key: {new_key}")
+
+    if with_tls:
+        if transport == "stdio":
+            raise click.ClickException("TLS has no effect on stdio transport.")
+        cert_path = CONFIG_DIR / "cert.pem"
+        key_path = CONFIG_DIR / "key.pem"
+        _gen_tls(host, cert_path, key_path)
+        cfg.server.ssl_certfile = str(cert_path)
+        cfg.server.ssl_keyfile = str(key_path)
+
+    write_config(cfg, config_path)
+    click.echo(f"\nSaved to {config_path}")
+
+    if transport == "stdio":
+        click.echo("\n─── Claude Desktop config (stdio) ───")
+        click.echo(
+            """\
+{
+  "mcpServers": {
+    "macos-mcp": {
+      "command": "uvx",
+      "args": ["macos-mcp", "serve"]
+    }
+  }
+}"""
+        )
+        return
+
+    scheme = "https" if with_tls else "http"
+    mcp_url = f"{scheme}://{host}:{port}/mcp/"
+    sse_url = f"{scheme}://{host}:{port}/sse"
+
+    click.echo("\n─── Start the server ───")
+    click.echo(f"  macos-mcp serve")
+
+    if transport == "sse":
+        click.echo("\n─── Claude Desktop config (SSE) ───")
+        click.echo(
+            f"""\
+{{
+  "mcpServers": {{
+    "macos-mcp": {{
+      "type": "sse",
+      "url": "{sse_url}",
+      "headers": {{ "Authorization": "Bearer {new_key}" }}
+    }}
+  }}
+}}"""
+        )
+    else:
+        click.echo("\n─── Claude Desktop config (Streamable HTTP) ───")
+        click.echo(
+            f"""\
+{{
+  "mcpServers": {{
+    "macos-mcp": {{
+      "type": "http",
+      "url": "{mcp_url}",
+      "headers": {{ "Authorization": "Bearer {new_key}" }}
+    }}
+  }}
+}}"""
+        )
+
+
+_AGENT_LABEL = "com.macos-mcp.server"
+_LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+_PLIST_PATH = _LAUNCH_AGENTS_DIR / f"{_AGENT_LABEL}.plist"
+
+
+def _find_free_port(host: str, preferred: int, max_tries: int = 100) -> int:
+    """Return the first free TCP port at or above preferred on host."""
+    for port in range(preferred, preferred + max_tries):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((host, port))
+                return port
+        except OSError:
+            continue
+    raise click.ClickException(
+        f"No free port found in range {preferred}–{preferred + max_tries - 1} on {host}."
+    )
+
+
+def _resolve_program() -> list[str]:
+    """Return the argv prefix to invoke `macos-mcp serve` from launchd."""
+    macos_mcp = shutil.which("macos-mcp")
+    if macos_mcp:
+        # Avoid paths inside uv's ephemeral tool cache (uvx runs)
+        if not any(m in macos_mcp for m in (".cache/uv", "uv/tools", "uv\\tools")):
+            return [macos_mcp]
+    uvx = shutil.which("uvx")
+    if uvx:
+        return [uvx, "macos-mcp"]
+    raise click.ClickException(
+        "Cannot find macos-mcp or uvx in PATH.\n"
+        "Install via: pip install macos-mcp  or  brew install uv"
+    )
+
+
+def _build_plist(program_args: list[str]) -> str:
+    log_out = CONFIG_DIR / "server.log"
+    log_err = CONFIG_DIR / "server.error.log"
+    payload = {
+        "Label": _AGENT_LABEL,
+        "ProgramArguments": program_args,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log_out),
+        "StandardErrorPath": str(log_err),
+    }
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode("utf-8")
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True)
+
+
+@main.command()
+@click.option(
+    "--transport",
+    type=click.Choice(["sse", "streamable-http"]),
+    default="streamable-http",
+    show_default=True,
+    help="Transport for the background server (stdio not supported as a service).",
+)
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind.")
+@click.option("--port", default=8000, show_default=True, type=int, help="Port to bind.")
+@click.option("--force", is_flag=True, help="Reinstall even if already installed.")
+def install(transport: str, host: str, port: int, force: bool) -> None:
+    """Install macos-mcp as a launchd Launch Agent that starts at login."""
+    if _PLIST_PATH.exists() and not force:
+        click.echo(f"Launch agent already installed at {_PLIST_PATH}.")
+        click.echo("Use --force to reinstall.")
+        return
+
+    # Auto-select a free port when the user didn't explicitly pass --port.
+    ctx = click.get_current_context()
+    if ctx.get_parameter_source("port") == click.core.ParameterSource.DEFAULT:
+        selected = _find_free_port(host, port)
+        if selected != port:
+            click.echo(f"Port {port} is in use — using {selected} instead.")
+        port = selected
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    exe = _resolve_program()
+    args = exe + ["serve", "--transport", transport, "--host", host, "--port", str(port)]
+    _PLIST_PATH.write_text(_build_plist(args))
+    click.echo(f"Wrote {_PLIST_PATH}")
+
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+
+    # Unload first if already running (needed for --force)
+    _launchctl("bootout", f"{domain}/{_AGENT_LABEL}")
+
+    result = _launchctl("bootstrap", domain, str(_PLIST_PATH))
+    if result.returncode != 0:
+        raise click.ClickException(f"launchctl bootstrap failed:\n{result.stderr.strip()}")
+
+    click.echo(f"Launch agent loaded — server is starting now.")
+    click.echo(f"  Transport : {transport}")
+    click.echo(f"  Address   : {host}:{port}")
+    click.echo(f"  Logs      : {CONFIG_DIR / 'server.log'}")
+    click.echo(f"\nThe server will restart automatically at every login.")
+    click.echo(f"Run `macos-mcp uninstall` to remove it.")
+
+
+@main.command()
+def uninstall() -> None:
+    """Remove the macos-mcp Launch Agent and stop the background server."""
+    uid = os.getuid()
+    result = _launchctl("bootout", f"gui/{uid}/{_AGENT_LABEL}")
+    if result.returncode == 0:
+        click.echo("Stopped the running server.")
+    elif _PLIST_PATH.exists():
+        # Agent wasn't loaded but plist exists — that's fine, just remove it
+        pass
+    else:
+        click.echo("No active launch agent found.")
+
+    if _PLIST_PATH.exists():
+        _PLIST_PATH.unlink()
+        click.echo(f"Removed {_PLIST_PATH}")
+    else:
+        click.echo("Plist already removed.")
+
+    click.echo("macos-mcp will no longer start at login.")
+
+
+@main.command()
+def doctor() -> None:
+    """Diagnose the local environment: Python, frameworks, TCC grants, tools."""
+    import importlib.util
+
+    ok = True
+
+    def check(label: str, good: bool, hint: str = "") -> None:
+        nonlocal ok
+        ok = ok and good
+        click.echo(f"  {'PASS' if good else 'FAIL'} {label}"
+                   + (f" — {hint}" if hint and not good else ""))
+
+    click.echo("macos-mcp doctor")
+    click.echo(f"  python: {sys.version.split()[0]} ({sys.executable})")
+
+    if sys.platform != "darwin":
+        click.echo("  note: not macOS — framework checks are import-only")
+
+    for mod, pip_pkg in (
+        ("ApplicationServices", "pyobjc-framework-ApplicationServices"),
+        ("Cocoa", "pyobjc-framework-Cocoa"),
+        ("Quartz", "pyobjc-framework-Quartz"),
+        ("Vision", "pyobjc-framework-Vision"),
+        ("objc", "pyobjc-core"),
+        ("fastmcp", "fastmcp"),
+        ("PIL", "pillow"),
+        ("mcp", "mcp"),
+    ):
+        check(f"module {mod}", importlib.util.find_spec(mod) is not None,
+              f"pip install {pip_pkg}")
+
+    for tool in ("pbcopy", "osascript", "launchctl", "pmset",
+                 "system_profiler", "networksetup", "log"):
+        check(f"tool {tool}", shutil.which(tool) is not None,
+              "expected on macOS — PATH problem?" )
+
+    if sys.platform == "darwin":
+        from macos_mcp.permissions import (
+            check_accessibility_permission,
+            check_screen_recording_permission,
+            accessibility_guidance,
+        )
+        check("Accessibility permission", check_accessibility_permission(),
+              accessibility_guidance())
+        check("Screen Recording permission",
+              check_screen_recording_permission(),
+              "System Settings > Privacy & Security > Screen Recording")
+
+    click.echo(f"\n{'OK' if ok else 'ISSUES FOUND'} — "
+               f"see FAIL lines above.")
+
+
+def _utf8_stdout() -> None:
+    """Tool output may contain arbitrary Unicode from window titles/UI text —
+    a legacy-codepage console must not crash the CLI on it."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _tool_registry() -> dict:
+    """Name → Tool map across FastMCP versions (private API fallback chain)."""
+    tool_mgr = getattr(mcp, "_tool_manager", None)
+    tools_dict = getattr(tool_mgr, "_tools", None)
+    if tools_dict is not None:
+        return dict(tools_dict)
+    provider = getattr(mcp, "_local_provider", None)
+    components = getattr(provider, "_components", {})
+    return {
+        (getattr(v, "name", None) or k.split(":", 1)[1].split("@", 1)[0]): v
+        for k, v in components.items()
+        if isinstance(k, str) and k.startswith("tool:")
+    }
+
+
+def _parse_call_args(pairs: list[str]) -> dict:
+    kwargs = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep:
+            raise click.ClickException(f"--arg must be key=value, got {pair!r}")
+        try:
+            kwargs[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            kwargs[key] = raw
+    return kwargs
+
+
+@main.command(name="tools")
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
+def list_tools(json_out: bool) -> None:
+    """List the registered tool names and descriptions."""
+    _utf8_stdout()
+    rows = []
+    for name, tool in sorted(_tool_registry().items()):
+        desc = (getattr(tool, "description", "") or "").split("\n")[0][:120]
+        rows.append({"name": name, "description": desc})
+    if json_out:
+        click.echo(json.dumps(rows, ensure_ascii=False))
+    else:
+        for row in rows:
+            click.echo(f"{row['name']:<22} {row['description']}")
+
+
+@main.command(name="call")
+@click.argument("tool_name")
+@click.option(
+    "--arg",
+    "pairs",
+    multiple=True,
+    help="Tool argument as key=value; value is JSON-decoded when possible "
+    "(e.g. --arg 'loc=[100,200]' --arg 'ref=\"@e5\"').",
+)
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
+@click.option(
+    "--save-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+    help="Directory for image payloads (default: ~/.macos-mcp/cli).",
+)
+def call_tool(tool_name: str, pairs: tuple[str, ...], json_out: bool,
+              save_dir: str | None) -> None:
+    """Invoke a tool directly without an MCP client.
+
+    Examples:
+      macos-mcp call Snapshot
+      macos-mcp call Click --arg 'ref="@e5"'
+      macos-mcp call Type --arg 'loc=[500,300]' --arg 'text="hello"'
+      macos-mcp call Shell --arg 'command="uname -a"'
+    """
+    global desktop, screen_size
+    import time as _time
+
+    kwargs = _parse_call_args(list(pairs))
+    tool = _tool_registry().get(tool_name)
+    if tool is None:
+        names = ", ".join(sorted(_tool_registry()))
+        raise click.ClickException(
+            f"unknown tool {tool_name!r}. Available: {names}")
+
+    if desktop is None:
+        desktop = Desktop()
+        screen_size = desktop.get_screen_size()
+
+    _utf8_stdout()
+    fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
+    result = fn(**kwargs)
+    if asyncio.iscoroutine(result):
+        result = asyncio.run(result)
+
+    items = result if isinstance(result, list) else [result]
+    counter = 0
+    for item in items:
+        data = getattr(item, "data", None)
+        if data is not None:
+            counter += 1
+            out_dir = save_dir or str(CONFIG_DIR / "cli")
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(
+                out_dir, f"image_{int(_time.time())}_{counter}.png")
+            with open(path, "wb") as f:
+                f.write(data)
+            click.echo(f"[image saved: {path}]")
+        elif hasattr(item, "text"):
+            click.echo(item.text)
+        elif json_out:
+            click.echo(json.dumps(item, ensure_ascii=False, default=str))
+        else:
+            click.echo(item)
+
+
+if __name__ == "__main__":
+    main()

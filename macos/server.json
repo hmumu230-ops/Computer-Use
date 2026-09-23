@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Jeomon/macos-mcp",
+  "title": "macOS-MCP",
+  "description": "MCP server for macOS desktop automation via the Accessibility API.",
+  "repository": {
+    "url": "https://github.com/Jeomon/macos-mcp",
+    "source": "github"
+  },
+  "version": "0.4.6",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "macos-mcp",
+      "version": "0.4.6",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "MACOS_MCP_SKIP_PERMISSION_CHECK",
+          "description": "Set to 1 to downgrade a failed Accessibility/Screen Recording permission check to a warning instead of exiting. Needed because some MCP hosts (e.g. Claude Desktop) spawn the server via a subprocess launcher that disclaims TCC responsibility, making AXIsProcessTrusted() report false even though the host's own grant is inherited for actual calls.",
+          "isRequired": false,
+          "format": "string",
+          "default": "1"
+        }
+      ],
+      "runtimeArguments": [
+        {
+          "description": "Run the macos-mcp server",
+          "value": "macos-mcp",
+          "format": "string",
+          "isRequired": true
+        }
+      ]
+    }
+  ]
+}

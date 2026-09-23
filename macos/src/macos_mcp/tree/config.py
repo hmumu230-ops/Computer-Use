@@ -1,0 +1,147 @@
+# Interactive roles - elements that users can interact with
+INTERACTIVE_ROLES = {
+    "AXButton",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXTextField",
+    "AXTextArea",
+    "AXComboBox",
+    "AXPopUpButton",
+    "AXSlider",
+    "AXIncrementor",
+    # 'AXImage',
+    "AXLink",
+    "AXMenuItem",
+    "AXMenuButton",
+    "AXMenuBarItem",
+    "AXTab",
+    "AXDockItem",
+    "AXCell",
+    # 'AXRow',
+    "AXToggle",
+    "AXSwitch",
+    "AXDisclosureTriangle",
+    "AXColorWell",
+    "AXLevelIndicator",
+    "AXValueIndicator",
+}
+
+# Container roles - elements that hold other elements
+CONTAINER_ROLES = {
+    "AXWindow",
+    "AXToolbar",
+    "AXGroup",
+    "AXScrollArea",
+    "AXSplitGroup",
+    "AXList",
+    "AXTabGroup",
+    "AXWebArea",
+    "AXPopover",
+    "AXSheet",
+    "AXLayoutArea",
+    "AXLayoutItem",
+}
+
+# Non-interactive roles - informational elements
+NON_INTERACTIVE_ROLES = {
+    "AXList",
+    "AXMenuBar",
+    "AXMenu",
+    "AXGroup",
+    "AXScrollArea",
+    "AXStaticText",
+    "AXRadioGroup",
+    "AXGrid",
+    "AXApplication",
+    "AXWindow",
+    "AXToolbar",
+    "AXSplitGroup",
+    "AXTabGroup",
+    "AXWebArea",
+}
+
+# Scrollable roles - elements that can be scrolled
+SCROLLABLE_ROLES = {
+    "AXScrollArea",
+    "AXScrollView",
+    "AXWebArea",
+    # 'AXTable',
+    # 'AXList',
+    # 'AXOutline',
+    "AXBrowser",
+    # 'AXTextArea',
+}
+
+# Actions that indicate an element is interactive
+INTERACTIVE_ACTIONS = {
+    "AXPress",
+    "AXConfirm",
+    "AXCancel",
+    "AXIncrement",
+    "AXDecrement",
+    "AXShowMenu",
+    "AXPick",
+    "AXRaise",
+}
+
+# Subroles that make an element interactive regardless of its role. A
+# Notification Centre banner is an AXGroup, which is not an interactive role,
+# but it is the thing a user clicks to open the notification. WhatsApp's chat
+# search reports AXStaticText for the same reason -- the role describes how the
+# element was built, while the subrole describes what it is for.
+INTERACTIVE_SUBROLES = {
+    "AXNotificationCenterBanner",
+    # A grouped/older notification -- e.g. several from the same app collapsed
+    # together -- is the same clickable thing under a second, undocumented
+    # subrole. Without it, only the single newest notification in a stack was
+    # captured and the rest were invisible despite being on screen.
+    "AXNotificationCenterBannerStack",
+    "AXSearchField",
+}
+
+# Roles whose AXValue is a state rather than a name. A checkbox reports 1 when
+# it is on, so using the value as a label yields a node called "1" -- true, but
+# no use to anyone deciding what to click. For these the linked title element
+# is the name, and the value belongs in metadata as state.
+STATE_VALUED_ROLES = {
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXDisclosureTriangle",
+}
+
+# Window control subroles with friendly names
+WINDOW_CONTROL_SUBROLES = {
+    "AXCloseButton": "Close Button",
+    "AXMinimizeButton": "Minimize Button",
+    "AXZoomButton": "Zoom Button",
+    "AXFullScreenButton": "Full Screen Button",
+}
+
+# Standard text-entry roles. These carry selection state, which tells an agent
+# whether typing would replace existing content or insert at a caret.
+TEXT_INPUT_ROLES = {
+    "AXTextField",
+    "AXTextArea",
+    "AXComboBox",
+    "AXSearchField",
+}
+# Roles that should be skipped during tree traversal to improve performance.
+# These are either pure decorative/structural elements with no interactive children
+# or elements whose subtrees never yield actionable nodes.
+PRUNABLE_ROLES = {
+    "AXScrollBar",
+    "AXGrowArea",
+    "AXUnknown",
+    "AXValueIndicator",
+    "AXLevelIndicator",
+    "AXProgressIndicator",
+    "AXSeparator",
+    "AXSplitter",
+    "AXHandle",
+    "AXRuler",
+    "AXRulerMarker",
+    "AXBusyIndicator",
+    "AXRelevanceIndicator",
+    "AXSizeHandle",
+    "AXResizeIndicator",
+}

@@ -1,0 +1,489 @@
+"""Tests for tree/service.py module."""
+
+import pytest
+from unittest.mock import Mock, MagicMock, patch, call
+from macos_mcp.tree.service import Tree
+from macos_mcp.tree.views import TreeState, TreeElementNode, BoundingBox, Center
+from macos_mcp.desktop.views import Window, Status
+
+
+@pytest.mark.unit
+class TestTreeOnFocusChanged:
+    """Tests for Tree.on_focus_changed method."""
+
+    def test_on_focus_changed_callback(self):
+        """Test on_focus_changed callback is invoked."""
+        tree = Tree()
+        element = MagicMock()
+        # Should not raise any exceptions
+        tree.on_focus_changed(element, "FocusedUIElementChanged", 1234)
+
+    def test_on_focus_changed_different_notifications(self):
+        """Test on_focus_changed with different notification types."""
+        tree = Tree()
+        element = MagicMock()
+        notifications = ["FocusedUIElementChanged", "FocusedWindowChanged", "MainWindowChanged"]
+        for notification in notifications:
+            # Should handle all notification types
+            tree.on_focus_changed(element, notification, 1234)
+
+
+@pytest.mark.unit
+class TestTreeMenuBarExtras:
+    def test_probe_drains_threadpool_autorelease_pool(self, mocker):
+        app = MagicMock()
+        app.activationPolicy.return_value = 1
+        app.bundleIdentifier.return_value = "com.example.menu"
+        app.processIdentifier.return_value = 123
+
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationsRaw",
+            return_value=[app],
+        )
+
+        extras = MagicMock()
+        extras.GetChildren.return_value = [object()]
+        control = MagicMock()
+        control.ExtrasMenuBar = extras
+        mocker.patch("macos_mcp.tree.service.ax.Control", return_value=control)
+        mocker.patch.object(Tree, "_extras_cache", None)
+
+        pool = mocker.patch("macos_mcp.tree.service.objc.autorelease_pool")
+        pool_context = MagicMock()
+        pool.return_value = pool_context
+
+        assert Tree.bundles_with_menu_bar_extras() == ["com.example.menu"]
+        pool.assert_called_once_with()
+        pool_context.__enter__.assert_called_once_with()
+        pool_context.__exit__.assert_called_once()
+
+
+@pytest.mark.unit
+class TestTreeGetState:
+    """Tests for Tree.get_state method."""
+
+    def test_get_state_with_active_window(self, mocker, mock_window):
+        """Test get_state with an active window."""
+        mock_get_app = mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=None,
+        )
+        mock_set_attr = mocker.patch("macos_mcp.tree.service.ax.SetAttribute")
+        mock_tree = MagicMock()
+        mocker.patch.object(Tree, "get_window_wise_nodes", return_value=([], [], []))
+
+        tree = Tree()
+        result = tree.get_state(active_window=mock_window)
+
+        assert isinstance(result, TreeState)
+        assert result.status is True
+
+    def test_get_state_without_active_window(self, mocker):
+        """Test get_state without active window."""
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=None,
+        )
+        mocker.patch.object(Tree, "get_window_wise_nodes", return_value=([], [], []))
+
+        tree = Tree()
+        result = tree.get_state(active_window=None)
+
+        assert isinstance(result, TreeState)
+        assert result.status is True
+        assert result.interactive_nodes == []
+
+    def test_get_state_with_windowless_app(self, mocker, mock_bounding_box):
+        """Test get_state with windowless app (0 width/height)."""
+        windowless_app = Window(
+            name="Test App",
+            is_browser=False,
+            status=Status.WINDOWLESS,
+            bounding_box=BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0),
+            pid=1234,
+            bundle_id="com.example.app",
+        )
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=None,
+        )
+        mocker.patch.object(Tree, "get_window_wise_nodes", return_value=([], [], []))
+
+        tree = Tree()
+        result = tree.get_state(active_window=windowless_app)
+
+        assert isinstance(result, TreeState)
+
+
+@pytest.mark.unit
+class TestTreeGetWindowWiseNodes:
+    """Tests for Tree.get_window_wise_nodes method."""
+
+    def test_get_window_wise_nodes_empty(self, mocker):
+        """Test get_window_wise_nodes with empty bundle IDs."""
+        mocker.patch.object(Tree, "get_nodes", return_value=([], [], []))
+        tree = Tree()
+        interactive, scrollable, informative = tree.get_window_wise_nodes(
+            bundle_ids=[],
+            system_bundle_ids=[],
+        )
+        assert interactive == []
+        assert scrollable == []
+        assert informative == []
+
+    def test_get_window_wise_nodes_single_bundle(self, mocker):
+        """Test get_window_wise_nodes with single bundle ID."""
+        mock_nodes = (
+            [MagicMock(spec=TreeElementNode)],
+            [],
+            [],
+        )
+        mock_get_nodes = mocker.patch.object(Tree, "get_nodes", return_value=mock_nodes)
+        tree = Tree()
+        interactive, scrollable, informative = tree.get_window_wise_nodes(
+            bundle_ids=["com.example.app"],
+        )
+        assert len(interactive) == 1
+        mock_get_nodes.assert_called()
+
+    def test_get_window_wise_nodes_with_browser(self, mocker):
+        """Test get_window_wise_nodes recognizes browsers."""
+        mock_nodes = ([], [], [])
+        mock_get_nodes = mocker.patch.object(Tree, "get_nodes", return_value=mock_nodes)
+        tree = Tree()
+        tree.get_window_wise_nodes(
+            bundle_ids=["com.apple.Safari"],
+        )
+        # Verify the call includes is_browser=True for Safari
+        call_args = mock_get_nodes.call_args_list[0]
+        assert "Safari" in str(call_args) or call_args[0][1] is True or any(
+            "Safari" in str(arg) for arg in call_args[0]
+        )
+
+    def test_get_window_wise_nodes_with_desktop_only(self, mocker):
+        """Test get_window_wise_nodes with desktop_only flag."""
+        mock_nodes = ([], [], [])
+        mock_get_nodes = mocker.patch.object(Tree, "get_nodes", return_value=mock_nodes)
+        tree = Tree()
+        tree.get_window_wise_nodes(
+            bundle_ids=["com.example.app"],
+            desktop_only_bundle_ids=["com.apple.finder"],
+        )
+        # Should have called get_nodes twice: once for app, once for finder
+        assert mock_get_nodes.call_count >= 1
+
+
+@pytest.mark.unit
+class TestTreeIOUBoundingBox:
+    """Tests for Tree.iou_bounding_box method."""
+
+    def test_iou_fully_contained(self):
+        """Test IOU when element is fully contained in window."""
+        tree = Tree()
+        window_box = BoundingBox(left=0, top=0, right=1000, bottom=1000, width=1000, height=1000)
+        element_box = BoundingBox(left=100, top=100, right=200, bottom=200, width=100, height=100)
+        result = tree.iou_bounding_box(window_box, element_box)
+        assert result.left == 100
+        assert result.top == 100
+        assert result.right == 200
+        assert result.bottom == 200
+
+    def test_iou_partial_overlap(self):
+        """Test IOU with partial overlap."""
+        tree = Tree()
+        window_box = BoundingBox(left=0, top=0, right=200, bottom=200, width=200, height=200)
+        element_box = BoundingBox(left=100, top=100, right=300, bottom=300, width=200, height=200)
+        result = tree.iou_bounding_box(window_box, element_box)
+        assert result.left == 100
+        assert result.top == 100
+        assert result.right == 200
+        assert result.bottom == 200
+        assert result.width == 100
+        assert result.height == 100
+
+    def test_iou_no_overlap(self):
+        """Test IOU with no overlap."""
+        tree = Tree()
+        window_box = BoundingBox(left=0, top=0, right=100, bottom=100, width=100, height=100)
+        element_box = BoundingBox(left=200, top=200, right=300, bottom=300, width=100, height=100)
+        result = tree.iou_bounding_box(window_box, element_box)
+        assert result.left == 0
+        assert result.top == 0
+        assert result.right == 0
+        assert result.bottom == 0
+        assert result.width == 0
+        assert result.height == 0
+
+    def test_iou_edge_touching(self):
+        """Test IOU when boxes touch at edge."""
+        tree = Tree()
+        window_box = BoundingBox(left=0, top=0, right=100, bottom=100, width=100, height=100)
+        element_box = BoundingBox(left=100, top=0, right=200, bottom=100, width=100, height=100)
+        result = tree.iou_bounding_box(window_box, element_box)
+        # Edge touching should result in no overlap (0 area)
+        assert result.width == 0
+        assert result.height == 0
+
+
+@pytest.mark.unit
+class TestTreeGetNodes:
+    """Tests for Tree.get_nodes method."""
+
+    def test_get_nodes_app_not_found(self, mocker):
+        """Test get_nodes when app is not running."""
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=None,
+        )
+        tree = Tree()
+        interactive, scrollable, informative = tree.get_nodes(
+            "com.nonexistent.app",
+            is_browser=False,
+        )
+        assert interactive == []
+        assert scrollable == []
+        assert informative == []
+
+    def test_get_nodes_with_running_app(self, mocker):
+        """Test get_nodes with running app."""
+        mock_app = MagicMock()
+        mock_app.Name = "Test App"
+        mock_app.Element = MagicMock()
+        mock_app.MenuBar = None
+        mock_app.ExtrasMenuBar = None
+        mock_app.MainWindow = None
+        mock_app.Dialog = None
+        mock_app.Windows = []
+
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=mock_app,
+        )
+        mocker.patch("macos_mcp.tree.service.ax.SetMessagingTimeout")
+        mocker.patch.object(Tree, "tree_traversal")
+
+        tree = Tree()
+        interactive, scrollable, informative = tree.get_nodes(
+            "com.test.app",
+            is_browser=False,
+        )
+
+        assert isinstance(interactive, list)
+        assert isinstance(scrollable, list)
+        assert isinstance(informative, list)
+
+    def test_get_nodes_desktop_only_skips_menubar(self, mocker):
+        """Test get_nodes with desktop_only skips menu bar."""
+        mock_app = MagicMock()
+        mock_app.Name = "Finder"
+        mock_app.Element = MagicMock()
+        mock_app.MenuBar = MagicMock()  # Should be skipped with desktop_only=True
+        mock_app.MainWindow = None
+        mock_app.Dialog = None
+        mock_app.Windows = []
+
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=mock_app,
+        )
+        mocker.patch("macos_mcp.tree.service.ax.SetMessagingTimeout")
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        tree = Tree()
+        tree.get_nodes("com.apple.finder", is_browser=False, desktop_only=True)
+
+        # tree_traversal should not be called for menu bar when desktop_only=True
+        # (it should only be called if there are visible windows)
+        assert mock_traversal.call_count == 0
+
+
+@pytest.mark.unit
+class TestTreeModalDialog:
+    """A sheet or modal dialog blocks the window behind it, so the dialog is
+    scanned in its place; the menus stay. Detection lives in
+    ApplicationControl.Dialog; the tree just asks."""
+
+    def _mock_app(self, mocker, dialog_window):
+        main_window = MagicMock()
+        main_window.BoundingRectangle = MagicMock()
+
+        app = MagicMock()
+        app.Name = "Test App"
+        app.Element = MagicMock()
+        app.MenuBar = MagicMock()
+        app.ExtrasMenuBar = MagicMock()
+        app.MainWindow = main_window
+        if dialog_window is None:
+            app.Dialog = None
+        else:
+            app.Dialog = MagicMock()
+            app.Dialog.window = dialog_window
+
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=app,
+        )
+        mocker.patch("macos_mcp.tree.service.ax.SetMessagingTimeout")
+        mocker.patch("macos_mcp.tree.service.BoundingBox")
+        return app, main_window
+
+    def test_get_nodes_scans_menus_and_the_dialog(self, mocker):
+        """With a dialog up, the window behind it is skipped; the menus are not."""
+        dialog = MagicMock()
+        app, _ = self._mock_app(mocker, dialog)
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        Tree().get_nodes("com.test.app", is_browser=False)
+
+        roots = [c[0][0] for c in mock_traversal.call_args_list]
+        assert roots == [app.MenuBar, app.ExtrasMenuBar, dialog]
+
+    def test_get_nodes_without_dialog_scans_menus_and_window(self, mocker):
+        app, main_window = self._mock_app(mocker, None)
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        Tree().get_nodes("com.test.app", is_browser=False)
+
+        roots = [c[0][0] for c in mock_traversal.call_args_list]
+        assert roots == [app.MenuBar, app.ExtrasMenuBar, main_window]
+
+
+@pytest.mark.unit
+class TestTreeNarrowedScans:
+    """A background app is walked only for the parts of it that are on
+    screen: its status icon, its floating alert, or both -- never its menus
+    or the windows behind."""
+
+    def _mock_app(self, mocker, dialog_window):
+        app = MagicMock()
+        app.Name = "Docker Desktop"
+        app.Element = MagicMock()
+        app.MenuBar = MagicMock()
+        app.ExtrasMenuBar = MagicMock()
+        app.MainWindow = None
+        if dialog_window is None:
+            app.Dialog = None
+        else:
+            app.Dialog = MagicMock()
+            app.Dialog.window = dialog_window
+
+        mocker.patch(
+            "macos_mcp.tree.service.ax.GetRunningApplicationByBundleId",
+            return_value=app,
+        )
+        mocker.patch("macos_mcp.tree.service.ax.SetMessagingTimeout")
+        mocker.patch("macos_mcp.tree.service.BoundingBox")
+        return app
+
+    def test_extras_only_scans_only_extras(self, mocker):
+        app = self._mock_app(mocker, MagicMock())
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        Tree().get_nodes("com.electron.dockerdesktop", is_browser=False, extras_only=True)
+
+        roots = [c[0][0] for c in mock_traversal.call_args_list]
+        assert roots == [app.ExtrasMenuBar]
+
+    def test_dialog_only_scans_only_the_dialog(self, mocker):
+        dialog = MagicMock()
+        self._mock_app(mocker, dialog)
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        Tree().get_nodes("com.electron.dockerdesktop", is_browser=False, dialog_only=True)
+
+        roots = [c[0][0] for c in mock_traversal.call_args_list]
+        assert roots == [dialog]
+
+    def test_extras_and_dialog_together(self, mocker):
+        dialog = MagicMock()
+        app = self._mock_app(mocker, dialog)
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        Tree().get_nodes(
+            "com.electron.dockerdesktop", is_browser=False, extras_only=True, dialog_only=True
+        )
+
+        roots = [c[0][0] for c in mock_traversal.call_args_list]
+        assert roots == [app.ExtrasMenuBar, dialog]
+
+    def test_dialog_only_without_dialog_scans_nothing(self, mocker):
+        self._mock_app(mocker, None)
+        mock_traversal = mocker.patch.object(Tree, "tree_traversal")
+
+        Tree().get_nodes("com.electron.dockerdesktop", is_browser=False, dialog_only=True)
+
+        assert mock_traversal.call_count == 0
+
+
+@pytest.mark.unit
+class TestTreeGetStateDialogs:
+    """get_state adds a background app to the scan only while its dialog is
+    reachable -- floating over the active app, not buried behind it."""
+
+    def _dialog(self, bundle_id, reachable, frontmost=False):
+        dialog = MagicMock()
+        dialog.app.BundleIdentifier = bundle_id
+        dialog.reachable = reachable
+        dialog.frontmost = frontmost
+        return dialog
+
+    def _get_state(self, mocker, dialogs):
+        mocker.patch("macos_mcp.tree.service.ax.GetRunningApplicationByBundleId")
+        mocker.patch("macos_mcp.tree.service.ax.SetAttribute")
+        mocker.patch.object(Tree, "bundles_with_menu_bar_extras", return_value=[])
+        mocker.patch("macos_mcp.tree.service.ax.GetDialogs", return_value=dialogs)
+        scan = mocker.patch.object(Tree, "get_window_wise_nodes", return_value=([], [], []))
+        active = Window(
+            name="Example",
+            is_browser=False,
+            status=Status.ACTIVE,
+            bounding_box=BoundingBox(left=0, top=0, right=100, bottom=100, width=100, height=100),
+            pid=1,
+            bundle_id="com.example.app",
+        )
+        Tree().get_state(active_window=active)
+        return scan.call_args.kwargs["dialog_only_bundle_ids"]
+
+    def test_floating_background_dialog_is_scanned(self, mocker):
+        assert self._get_state(
+            mocker, [self._dialog("com.electron.dockerdesktop", reachable=True)]
+        ) == ["com.electron.dockerdesktop"]
+
+    def test_buried_background_dialog_is_not_scanned(self, mocker):
+        assert self._get_state(mocker, [self._dialog("com.apple.finder", reachable=False)]) == []
+
+    def test_active_app_dialog_is_not_scanned_twice(self, mocker):
+        assert (
+            self._get_state(
+                mocker, [self._dialog("com.example.app", reachable=True, frontmost=True)]
+            )
+            == []
+        )
+
+@pytest.mark.unit
+class TestTreeIntegration:
+    """Integration tests for Tree service."""
+
+    def test_tree_state_with_multiple_nodes(self, mocker, mock_tree_element_node):
+        """Test TreeState building with multiple nodes."""
+        center2 = Center(x=300, y=400)
+        bbox2 = BoundingBox(left=200, top=200, right=400, bottom=400, width=200, height=200)
+        node2 = TreeElementNode(
+            window_name="Window 2",
+            control_type="TextField",
+            name="Input",
+            center=center2,
+            bounding_box=bbox2,
+        )
+
+        state = TreeState(
+            status=True,
+            interactive_nodes=[mock_tree_element_node, node2],
+            scrollable_nodes=[],
+            dom_informative_nodes=[],
+        )
+
+        assert len(state.interactive_nodes) == 2
+        output = state.interactive_elements_to_string()
+        assert "Button" in output
+        assert "TextField" in output

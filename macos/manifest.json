@@ -1,0 +1,101 @@
+{
+  "manifest_version": "0.4",
+  "name": "MacOS-MCP",
+  "version": "0.4.6",
+  "description": "Lightweight MCP Server for macOS desktop interaction",
+  "long_description": "MacOS-MCP is a lightweight, open-source MCP server that bridges AI agents with the macOS operating system. It enables LLM agents to perform real-world tasks such as app launching, window management, UI interaction, browser automation, desktop state capture, and shell execution using native macOS accessibility and automation APIs.\n\n**KEY FEATURES**\n- **Native macOS Integration**: Interact with applications, windows, and UI elements through the macOS Accessibility API and Quartz event system.\n- **Bring Your Own LLM/VLM**: Works with any language model and optionally provides visual snapshots when needed.\n- **Rich Toolset for Desktop Automation**: Pre-built tools for application control, mouse and keyboard input, scrolling, shell commands, and desktop state capture.\n- **Lightweight and Open Source**: Minimal setup with a focused Python package and MIT license.\n\n**MINIMUM REQUIREMENTS**\n- Python 3.11 or higher\n- macOS 12 or higher\n- Accessibility permissions granted to the terminal or application running the MCP server\n- UV Package Manager\nThis MCP server uses UV for running the package in a managed Python environment.\nInstallation:\n`curl -LsSf https://astral.sh/uv/install.sh | sh`\nFor detailed installation instructions, [see the UV documentation](https://docs.astral.sh/uv/)",
+  "author": {
+    "name": "CursorTouch",
+    "url": "https://github.com/CursorTouch/MacOS-MCP"
+  },
+  "homepage": "https://github.com/CursorTouch/MacOS-MCP",
+  "documentation": "https://github.com/CursorTouch/MacOS-MCP",
+  "icon": "assets/logo.png",
+  "server": {
+    "type": "python",
+    "entry_point": "./src/macos_mcp/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${__dirname}",
+        "run",
+        "macos-mcp",
+        "serve"
+      ],
+      "env": {
+        "MACOS_MCP_SKIP_PERMISSION_CHECK": "1"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "App",
+      "description": "Manages macOS applications with four modes: 'launch' (opens the application), 'resize' (adjusts active window size), 'move' (repositions active window), 'switch' (brings specific app into focus)."
+    },
+    {
+      "name": "Shell",
+      "description": "Execute commands on macOS. Modes: 'shell' (default) for bash/zsh commands, 'osascript' for AppleScript. Use for file system, process management, system operations, and automation scripts."
+    },
+    {
+      "name": "Snapshot",
+      "description": "Captures complete desktop state including: focused window, open applications, interactive elements (buttons, text fields, links, menus with coordinates), and scrollable areas. Set use_vision=True to include screenshot with numbered annotations on interactive elements."
+    },
+    {
+      "name": "Click",
+      "description": "Performs mouse clicks at specified coordinates [x, y]. Supports button types: 'left' for selection/activation, 'right' for context menus, 'middle'. Supports clicks: 0=hover only, 1=single click, 2=double click."
+    },
+    {
+      "name": "Type",
+      "description": "Types text at specified coordinates [x, y]. Set clear=True to clear existing text first. Set press_enter=True to submit after typing. Set caret_position to 'start', 'end', or 'idle' (default)."
+    },
+    {
+      "name": "Scroll",
+      "description": "Scrolls at coordinates [x, y] or current mouse position if loc=None. Type: vertical (default) or horizontal. Direction: up/down for vertical, left/right for horizontal. wheel_times controls scroll amount."
+    },
+    {
+      "name": "Move",
+      "description": "Moves mouse cursor to coordinates [x, y]. Set drag=True to perform a drag-and-drop operation from current position to target coordinates."
+    },
+    {
+      "name": "Shortcut",
+      "description": "Executes keyboard shortcuts using key combinations separated by +. Examples: 'command+c' (copy), 'command+v' (paste), 'command+tab' (switch apps), 'command+space' (Spotlight). Note: Use 'command' instead of 'ctrl' on macOS."
+    },
+    {
+      "name": "Wait",
+      "description": "Pauses execution for specified duration in seconds. Use when waiting for: applications to launch, UI animations to complete, content to load. Helps ensure UI is ready before next interaction."
+    },
+    {
+      "name": "Scrape",
+      "description": "Fetch content from a URL. Performs a lightweight HTTP request and returns the page content as text."
+    },
+{
+      "name": "Desktop",
+      "description": "Manages Mission Control desktop Spaces. mode='create' opens Mission Control and clicks 'Add Desktop' to create a new virtual desktop via Accessibility (AppleScript only as fallback)."
+    },
+    {
+      "name": "Notification",
+      "description": "Sends a macOS notification banner with a message, title, optional subtitle, and optional sound. Supported sounds: Glass, Ping, Basso, Tink, Funk, Bottle, Frog, Hero, Morse, Pop, Purr, Sosumi, Submarine."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  },
+  "keywords": [
+    "macos",
+    "desktop",
+    "automation",
+    "ai",
+    "mcp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CursorTouch/MacOS-MCP"
+  }
+}

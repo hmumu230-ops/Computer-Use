@@ -1,0 +1,16 @@
+.venv
+# *.png
+# *.txt
+__pycache__
+experiments
+.claude
+*.ipynb
+*.mcpb
+node_modules
+dist/
+*.egg-info/
+.tau/
+.auto/
+
+# frozen app build
+/build/

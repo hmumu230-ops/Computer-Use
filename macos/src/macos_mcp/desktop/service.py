@@ -1,0 +1,1110 @@
+from macos_mcp.desktop.config import BROWSER_BUNDLE_IDS, EXCLUDED_BUNDLE_IDS
+from macos_mcp.desktop.views import DesktopState, Dialog, Size, Window, Status
+from macos_mcp.tree.views import BoundingBox, TreeElementNode
+from PIL import Image, ImageDraw, ImageFont, ImageGrab
+from typing import Literal, Optional, Tuple, Union
+from macos_mcp.tree.service import Tree
+from macos_mcp import refs
+from concurrent.futures import ThreadPoolExecutor
+import macos_mcp.ax as ax
+import asyncio
+import objc
+import requests
+import logging
+import random
+import json
+import io
+import os
+import time
+
+logger = logging.getLogger(__name__)
+
+
+def _call_with_autorelease_pool(func, /, *args, **kwargs):
+    """Run Objective-C/PyObjC work with a pool on a secondary worker thread."""
+    with objc.autorelease_pool():
+        return func(*args, **kwargs)
+
+
+async def _to_thread_with_autorelease_pool(func, /, *args, **kwargs):
+    return await asyncio.to_thread(_call_with_autorelease_pool, func, *args, **kwargs)
+
+
+def _dialog_view(info: ax.DialogInfo) -> Dialog:
+    return Dialog(title=info.title, reachable=info.reachable)
+
+
+class Desktop:
+    def __init__(self):
+        self.tree = Tree()
+        self.desktop_state = None
+
+    def get_screen_size(self) -> Size:
+        """Return the virtual screen size (all displays combined) in logical points."""
+        width, height = ax.GetScreenSize()
+        return Size(width=width, height=height)
+
+    def get_state(
+        self,
+        use_vision: bool = False,
+        as_bytes: bool = False,
+        scale: float = 1.0,
+    ):
+        refs.STORE.new_generation()
+        windows = self.get_windows()
+        active_window = self.get_foreground_window()
+        tree_state = self.tree.get_state(active_window=active_window)
+        if use_vision:
+            screenshot = self.get_annotated_screenshot(
+                nodes=tree_state.interactive_nodes,
+                as_bytes=as_bytes,
+                scale=scale,
+            )
+        else:
+            screenshot = None
+        return DesktopState(
+            active_window=active_window,
+            windows=windows,
+            screenshot=screenshot,
+            tree_state=tree_state,
+        )
+
+    def app(
+        self,
+        mode: Literal["launch", "resize", "move", "switch"] = "launch",
+        name: Optional[str] = None,
+        window_loc: Optional[Tuple[int, int]] = None,
+        window_size: Optional[Tuple[int, int]] = None,
+    ) -> str:
+        """Manage applications: launch, resize, move, or switch focus."""
+        if mode == "launch":
+            if not name:
+                return "App name or bundle ID required for launch."
+            ok = ax.LaunchApplication(name)
+            return f"Launched {name}." if ok else f"Failed to launch {name}."
+        if mode == "switch":
+            if not name:
+                return "App name or bundle ID required for switch."
+            app = ax.GetRunningApplicationByName(
+                name
+            ) or ax.GetRunningApplicationByBundleId(name)
+            if not app:
+                return f"Application '{name}' not found."
+            ax.ActivateApplication(app.PID)
+            time.sleep(0.2)
+            return f"Switched to {name}."
+        if mode == "resize":
+            app = ax.GetFrontmostApplication()
+            if not app or not app.MainWindow:
+                return "No frontmost window to resize."
+            win = app.MainWindow
+            if not window_size:
+                return "window_size required for resize mode."
+            win.Resize(float(window_size[0]), float(window_size[1]))
+            return "Window resized."
+        if mode == "move":
+            app = ax.GetFrontmostApplication()
+            if not app or not app.MainWindow:
+                return "No frontmost window to move."
+            win = app.MainWindow
+            if not window_loc:
+                return "window_loc required for move mode."
+            win.MoveWindowTo(float(window_loc[0]), float(window_loc[1]))
+            return "Window moved."
+        return f"Unknown mode: {mode}"
+
+    def execute_command(
+        self,
+        command: str,
+        mode: Literal["shell", "osascript"] = "shell",
+        timeout: int = 10,
+    ) -> Tuple[str, int]:
+        """Execute a shell or AppleScript command."""
+        return ax.ExecuteCommand(command, mode=mode, timeout=timeout)
+
+    def notify(
+        self,
+        message: str,
+        title: str = "Notification",
+        subtitle: Optional[str] = None,
+        sound: Optional[str] = None,
+    ) -> str:
+        """Send a macOS notification banner."""
+        import subprocess
+
+        script = (
+            f"display notification {json.dumps(message, ensure_ascii=False)}"
+            f" with title {json.dumps(title, ensure_ascii=False)}"
+        )
+        if subtitle:
+            script += f" subtitle {json.dumps(subtitle, ensure_ascii=False)}"
+        if sound:
+            script += f" sound name {json.dumps(sound, ensure_ascii=False)}"
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return f"Notification sent: [{title}] {message}"
+        return f"Failed to send notification: {result.stderr.strip()}"
+
+    def click(
+        self,
+        loc: Tuple[int, int],
+        button: Literal["left", "right", "middle"] = "left",
+        clicks: int = 1,
+    ) -> None:
+        """Perform mouse click at coordinates."""
+        x, y = loc
+        if clicks == 0:
+            ax.MoveTo(x, y)
+            return
+        if button == "left":
+            if clicks == 2:
+                ax.DoubleClick(x, y)
+            else:
+                ax.Click(x, y)
+        elif button == "right":
+            ax.RightClick(x, y)
+        elif button == "middle":
+            ax.MiddleClick(x, y)
+
+    def type(
+        self,
+        loc: Tuple[int, int],
+        text: str,
+        caret_position: Literal["start", "idle", "end"] = "idle",
+        clear: bool = False,
+        press_enter: bool = False,
+    ) -> None:
+        """Type text at coordinates. Clicks to focus first."""
+        x, y = loc
+        ax.MoveTo(x, y)
+        ax.Click(x, y)
+        time.sleep(0.1)
+        if clear:
+            ax.HotKey("command", "a")
+            time.sleep(0.05)
+            ax.HotKey("delete")
+            time.sleep(0.05)
+        if caret_position == "start":
+            ax.HotKey("command", "left")
+            time.sleep(0.02)
+        elif caret_position == "end":
+            ax.HotKey("command", "right")
+            time.sleep(0.02)
+        ax.TypeText(text)
+        if press_enter:
+            ax.KeyPress(ax.KeyCode.Return)
+
+    def scroll(
+        self,
+        loc: Optional[Tuple[int, int]],
+        scroll_type: Literal["horizontal", "vertical"],
+        direction: Literal["up", "down", "left", "right"],
+        wheel_times: int = 1,
+    ) -> Optional[str]:
+        """Scroll at coordinates or current mouse position."""
+        if loc:
+            ax.MoveTo(loc[0], loc[1])
+            time.sleep(0.05)
+        mult = 1 if direction in ("down", "right") else -1
+        for _ in range(wheel_times):
+            if scroll_type == "vertical":
+                if direction in ("up", "down"):
+                    ax.WheelUp(1) if mult < 0 else ax.WheelDown(1)
+                else:
+                    return "Use direction 'up' or 'down' for vertical scroll."
+            else:
+                if direction in ("left", "right"):
+                    ax.WheelLeft(1) if mult < 0 else ax.WheelRight(1)
+                else:
+                    return "Use direction 'left' or 'right' for horizontal scroll."
+            time.sleep(0.05)
+        return None
+
+    def move(self, loc: Tuple[int, int]) -> None:
+        """Move mouse cursor to coordinates."""
+        ax.MoveTo(loc[0], loc[1])
+
+    def drag(self, loc: Tuple[int, int]) -> None:
+        """Drag from current position to target coordinates."""
+        start = ax.GetCursorPos()
+        ax.DragTo(start[0], start[1], loc[0], loc[1])
+
+    # ------------------------------------------------------------------
+    # @eN element refs / @wN window refs (enhanced fork)
+    # ------------------------------------------------------------------
+
+    def _ax_probe(self, element) -> bool:
+        """Liveness probe for a held AXUIElementRef."""
+        try:
+            return ax.GetElementPid(element) is not None
+        except Exception:
+            return False
+
+    def _ax_search(self, pid: int, role: str, name: str, nth: int):
+        """Re-find an element inside its app by (role, name, nth).
+
+        Names come from the traversal label ladder (title → description →
+        value → placeholder → identifier), so match against all of them.
+        """
+        try:
+            from macos_mcp.ax.controls import ApplicationControl
+
+            app = ApplicationControl(pid=pid)
+        except Exception:
+            return None
+        target = (name or "").casefold()
+
+        def _name_match(ctrl) -> bool:
+            if not target:
+                return True
+            for attr in (
+                ax.Attribute.Title,
+                ax.Attribute.Description,
+                ax.Attribute.Value,
+                ax.Attribute.Identifier,
+            ):
+                v = ax.GetAttribute(ctrl.Element, attr)
+                if v is not None and str(v).casefold() == target:
+                    return True
+            return False
+
+        try:
+            ctrl = ax.Control(
+                searchFromControl=app,
+                role=role or None,
+                predicate=_name_match,
+                foundIndex=nth + 1,
+                searchInterval=0.2,
+            )
+            return ctrl.Element if ctrl.Exists(maxSearchSeconds=1.0) else None
+        except Exception:
+            return None
+
+    def resolve_element(self, ref: str) -> refs.ElementRef:
+        """Resolve @eN → ElementRef with a live (or re-found) element."""
+        return refs.STORE.resolve_element(
+            ref, probe=self._ax_probe, search=self._ax_search
+        )
+
+    def ref_center(self, ref: str) -> Tuple[int, int]:
+        """Resolve @eN/@wN → a click point in screen coordinates."""
+        obj = refs.STORE.get(ref)
+        if isinstance(obj, refs.WindowRef):
+            wr = self.resolve_window(ref)
+            g = wr.geometry or {}
+            return (int(g.get("x", 0) + g.get("w", 0) // 2),
+                    int(g.get("y", 0) + g.get("h", 0) // 2))
+        er = self.resolve_element(ref)
+        if er.element is not None and not er.synthetic:
+            rect = ax.GetRect(er.element)
+            if rect:
+                return (int(rect.center[0]), int(rect.center[1]))
+        bb = er.bbox or {}
+        return (int(bb.get("x", 0) + bb.get("w", 0) // 2),
+                int(bb.get("y", 0) + bb.get("h", 0) // 2))
+
+    def resolve_window(self, ref: str) -> refs.WindowRef:
+        """Resolve @wN → WindowRef, re-binding a live AX window element."""
+        wr = refs.STORE.get(ref)
+        if not isinstance(wr, refs.WindowRef):
+            raise refs.StaleRef(f"{ref} is not a window ref")
+        if wr.element is not None and self._ax_probe(wr.element):
+            return wr
+        try:
+            from macos_mcp.ax.controls import ApplicationControl
+
+            app = ApplicationControl(pid=wr.pid)
+            for w in app.Windows or []:
+                if (w.Name or "") == wr.title:
+                    wr.element = w.Element
+                    return wr
+        except Exception:
+            pass
+        raise refs.StaleRef(
+            f"{ref} ('{wr.title}') no longer resolves",
+            hint="window closed or renamed; take a fresh Snapshot")
+
+    def act(self, ref: str, action: str = "AXPress") -> str:
+        """Semantic AX action on @eN — no coordinates (poka-yoke)."""
+        er = self.resolve_element(ref)
+        if er.synthetic or er.element is None:
+            raise refs.CuError(
+                f"ref {ref} is synthetic — no semantic action",
+                hint="use click with coordinates instead")
+        available = ax.GetActionNames(er.element) or []
+        if action not in available:
+            raise refs.CuError(
+                f"{er.role} does not advertise {action}",
+                hint=f"available: {', '.join(available) or 'none'}")
+        if not ax.PerformAction(er.element, action):
+            raise refs.CuError(f"{action} failed on {ref}")
+        return f"{action} on {ref} ({er.role} '{er.name}')"
+
+    def click_ref(
+        self,
+        ref: str,
+        button: Literal["left", "right", "middle"] = "left",
+        clicks: int = 1,
+    ) -> str:
+        """Pattern-first click: AXPress/AXShowMenu before synthetic coords."""
+        er = self.resolve_element(ref)
+        if not er.synthetic and er.element is not None:
+            actions = ax.GetActionNames(er.element) or []
+            semantic = None
+            if button == "left" and clicks == 1 and "AXPress" in actions:
+                semantic = "AXPress"
+            elif button == "right" and "AXShowMenu" in actions:
+                semantic = "AXShowMenu"
+            if semantic and ax.PerformAction(er.element, semantic):
+                return f"{semantic} on {ref}"
+        x, y = self.ref_center(ref)
+        self.click((x, y), button, clicks)
+        return f"clicked {ref} at ({x},{y})"
+
+    def type_ref(
+        self,
+        ref: str,
+        text: str,
+        clear: bool = False,
+        press_enter: bool = False,
+    ) -> str:
+        """Focus + set AXValue when settable; else coords + key events."""
+        er = self.resolve_element(ref)
+        el = er.element if not er.synthetic else None
+        if el is not None:
+            if ax.IsAttributeSettable(el, ax.Attribute.Focused):
+                ax.SetAttribute(el, ax.Attribute.Focused, True)
+                time.sleep(0.05)
+            if ax.IsAttributeSettable(el, ax.Attribute.Value):
+                if clear:
+                    ax.SetAttribute(el, ax.Attribute.Value, "")
+                ax.SetAttribute(el, ax.Attribute.Value, text)
+                if press_enter:
+                    ax.KeyPress(ax.KeyCode.Return)
+                return f"set AXValue on {ref}"
+        x, y = self.ref_center(ref)
+        self.type((x, y), text, caret_position="idle", clear=clear,
+                  press_enter=press_enter)
+        return f"typed into {ref} at ({x},{y})"
+
+    def set_value_ref(self, ref: str, value: str) -> str:
+        """Set AXValue directly (sliders, text fields, checkboxes)."""
+        er = self.resolve_element(ref)
+        if er.synthetic or er.element is None:
+            raise refs.CuError(f"synthetic ref {ref} has no AXValue")
+        if not ax.IsAttributeSettable(er.element, ax.Attribute.Value):
+            raise refs.CuError(
+                f"AXValue not settable on {ref} ({er.role})",
+                hint="use type/click instead")
+        ax.SetAttribute(er.element, ax.Attribute.Value, value)
+        return f"AXValue set on {ref}"
+
+    def _name_pred(self, name: str):
+        target = (name or "").casefold()
+
+        def _match(ctrl) -> bool:
+            if not target:
+                return True
+            for attr in (
+                ax.Attribute.Title,
+                ax.Attribute.Description,
+                ax.Attribute.Value,
+                ax.Attribute.Identifier,
+            ):
+                v = ax.GetAttribute(ctrl.Element, attr)
+                if v is not None and target in str(v).casefold():
+                    return True
+            return False
+
+        return _match
+
+    def find_elements(
+        self,
+        role: str = "",
+        name: str = "",
+        pid: int = 0,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Live AX search; each hit is registered as a fresh @eN ref."""
+        from macos_mcp.ax.controls import ApplicationControl, _find_recursive_raw
+
+        if not pid:
+            front = ax.GetFrontmostApplication()
+            pid = front.PID if front else 0
+        app = ApplicationControl(pid=pid)
+        hits: list = []
+        _find_recursive_raw(
+            app.Element, hits, role or None, None, None, None,
+            self._name_pred(name), 25, 0, find_first=False,
+        )
+        out = []
+        for el in hits[:limit]:
+            r = ax.GetRect(el)
+            er = refs.STORE.add_element(
+                element=el, pid=pid,
+                role=ax.GetAttribute(el, ax.Attribute.Role) or "",
+                name=name or str(ax.GetAttribute(el, ax.Attribute.Title) or ""),
+                bbox=({"x": int(r.left), "y": int(r.top),
+                       "w": int(r.width), "h": int(r.height)} if r else None),
+            )
+            out.append({"ref": er.ref, "role": er.role, "name": er.name,
+                        "bbox": er.bbox})
+        return out
+
+    def clipboard(
+        self,
+        what: str = "text",
+        text: str = "",
+        image_png: bytes | None = None,
+        files: list | None = None,
+        get: bool = False,
+    ) -> dict:
+        """Read/write clipboard payloads (text/image/files)."""
+        from macos_mcp import clipboard as clip
+
+        return clip.clipboard(what=what, text=text, image_png=image_png,
+                              files=files, get=get)
+
+    def find_text(
+        self,
+        needle: str,
+        case_sensitive: bool = False,
+        languages: list | None = None,
+    ) -> list[dict]:
+        """OCR the screen (Vision) and register each hit as a synthetic @eN.
+
+        ImageGrab captures physical pixels (2x on Retina) while AX/logical
+        coordinates are points — boxes are divided by the capture scale so
+        the minted refs land in screen space.
+        """
+        from macos_mcp import ocr
+
+        img = self.get_screenshot()
+        if img is None:
+            raise refs.CuError(
+                "screenshot failed", hint="check Screen Recording permission")
+        screen = self.get_screen_size()
+        scale = (img.width / screen.width) if screen.width else 1.0
+        hits = ocr.find_text(img, needle, languages=languages,
+                             case_sensitive=case_sensitive)
+        out = []
+        for h in hits:
+            bb = {k: int(v / scale) for k, v in h.bbox.items()} \
+                if scale != 1.0 else h.bbox
+            er = refs.STORE.add_synthetic(
+                bb, h.text, metadata={"via": "ocr", "conf": h.confidence})
+            out.append({"ref": er.ref, "text": h.text, "bbox": bb,
+                        "confidence": h.confidence})
+        return out
+
+    def wait_for(
+        self,
+        ref: str = "",
+        role: str = "",
+        name: str = "",
+        timeout: float = 10.0,
+    ) -> dict:
+        """Poll until a ref resolves, or a (role,name) match appears."""
+        deadline = time.time() + timeout
+        hint = refs.STORE.try_get(ref) if ref else None
+        if ref and hint is None:
+            raise refs.StaleRef(
+                f"unknown ref {ref}", hint="refs mint from Snapshot")
+        is_window = isinstance(hint, refs.WindowRef)
+        while True:
+            try:
+                if is_window:
+                    wr = self.resolve_window(ref)
+                    return {"ref": wr.ref, "role": "AXWindow",
+                            "name": wr.title}
+                if ref:
+                    er = self.resolve_element(ref)
+                    return {"ref": er.ref, "role": er.role, "name": er.name}
+                hits = self.find_elements(
+                    role=role, name=name,
+                    pid=hint.pid if hint else 0, limit=1)
+                if hits:
+                    return hits[0]
+            except refs.StaleRef:
+                pass  # dead ref — keep polling; it may resolve again
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                raise refs.CuError(
+                    f"wait_for timed out after {timeout}s",
+                    hint="element never appeared; take a fresh Snapshot")
+            time.sleep(0.4)
+
+    def shortcut(self, shortcut: str) -> None:
+        """Execute keyboard shortcut (e.g. 'command+c')."""
+        keys = [k.strip().lower() for k in shortcut.split("+")]
+        if not keys or any(not key for key in keys):
+            raise ValueError(
+                "shortcut must contain non-empty key names separated by '+'"
+            )
+        ax.HotKey(*keys)
+
+    def scrape(self, url: str) -> str:
+        """Fetch URL content as markdown."""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }
+            r = requests.get(url, timeout=10, headers=headers)
+            r.raise_for_status()
+            from markdownify import markdownify
+            return markdownify(r.text, strip=["script", "style"])
+        except Exception as e:
+            return str(e)
+
+    def wait(self, duration: int) -> None:
+        """Pause for the specified number of seconds."""
+        time.sleep(duration)
+
+    def create_desktop_space(
+        self,
+        open_delay: float = 0.9,
+        close_after: bool = True,
+    ) -> str:
+        """
+        Create a new Mission Control desktop Space.
+
+        Uses Accessibility (AX) on the Dock's Mission Control UI and verifies
+        the space count increased before reporting success.
+        """
+        ok, message = ax.CreateDesktopSpace(
+            open_delay=open_delay,
+            close_after=close_after,
+        )
+        return message if ok else f"Failed: {message}"
+
+    def get_foreground_window(self) -> Optional[Window]:
+        FINDER_BUNDLE_ID = "com.apple.finder"
+        # GetFrontmostApplication is the most reliable source for the active app
+        pid = None
+        frontmost = ax.GetFrontmostApplication()
+        if frontmost:
+            try:
+                pid = frontmost.PID
+            except Exception:
+                pid = None
+        if not pid:
+            pid = ax.GetMenuBarOwningApplication()
+        if not pid:
+            pid = ax.GetForegroundWindowPID()
+        app = None
+        if pid:
+            try:
+                from macos_mcp.ax.controls import ApplicationControl
+                app = ApplicationControl(pid=pid)
+            except Exception:
+                app = None
+        if app is None:
+            app = ax.GetRunningApplicationByBundleId(FINDER_BUNDLE_ID)
+        if app is None:
+            return None
+        window = None
+        try:
+            window = app.MainWindow
+        except Exception:
+            window = None
+        if window is None:
+            bundle_id = app.BundleIdentifier or FINDER_BUNDLE_ID
+            status_str = app.Status
+            try:
+                status = Status(status_str)
+            except ValueError:
+                status = Status.ACTIVE
+            if bundle_id != FINDER_BUNDLE_ID:
+                # Non-Finder app is active but has no visible window (e.g. minimized).
+                # Return it as-is so the tree scans its menu bar correctly.
+                # The tree service will separately scan Finder's desktop icons.
+                return Window(
+                    name=app.Name or bundle_id,
+                    is_browser=bundle_id in BROWSER_BUNDLE_IDS,
+                    status=status,
+                    bounding_box=BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0),
+                    pid=app.PID,
+                    bundle_id=bundle_id,
+                )
+            # Finder is active but has no open window (desktop-only state).
+            # Return a windowless Finder Window so the tree still scans the desktop.
+            return Window(
+                name="Finder",
+                is_browser=False,
+                status=status,
+                bounding_box=BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0),
+                pid=app.PID,
+                bundle_id=bundle_id,
+            )
+        is_browser = app.BundleIdentifier in BROWSER_BUNDLE_IDS
+        rect = window.BoundingRectangle
+        if rect:
+            bounding_box = BoundingBox(
+                left=int(rect.left),
+                top=int(rect.top),
+                right=int(rect.right),
+                bottom=int(rect.bottom),
+                width=int(rect.width),
+                height=int(rect.height),
+            )
+        else:
+            bounding_box = BoundingBox(
+                left=0, top=0, right=0, bottom=0, width=0, height=0
+            )
+        status_str = app.Status
+        try:
+            status = Status(status_str)
+        except ValueError:
+            status = Status.ACTIVE
+        dialog = app.Dialog
+        return Window(
+            name=window.Name,
+            is_browser=is_browser,
+            status=status,
+            bounding_box=bounding_box,
+            pid=app.PID,
+            bundle_id=app.BundleIdentifier,
+            dialog=_dialog_view(dialog) if dialog else None,
+        )
+
+    def get_windows(self) -> list[Window]:
+        """
+        Get list of user-facing application windows on the desktop.
+        Uses the ax module's ApplicationControl API for all data.
+
+        Returns:
+            windows — list of Window objects
+        """
+        # Get all regular (Dock-visible) applications
+        apps = ax.GetRunningApplications(policy="Regular")
+
+        # One pass over the window server finds every dialog on screen, whoever
+        # owns it. An app that is not Regular -- Docker Desktop is an accessory
+        # app -- can still block itself with an alert without ever being
+        # frontmost; such apps are listed only while that dialog is up.
+        dialogs = {dialog.app.PID: dialog for dialog in ax.GetDialogs()}
+        regular_pids = {app.PID for app in apps}
+        background_apps = [dialog.app for pid, dialog in dialogs.items() if pid not in regular_pids]
+
+        def _describe(app) -> Optional[Window]:
+            bundle_id = app.BundleIdentifier or ""
+            dialog = dialogs.get(app.PID)
+            # Finder is normally noise -- always running, usually just the
+            # desktop -- but not while it is asking the user something.
+            if bundle_id in EXCLUDED_BUNDLE_IDS and dialog is None:
+                return None
+
+            app_name = app.Name or ""
+            pid = app.PID
+            is_browser = bundle_id in BROWSER_BUNDLE_IDS
+
+            # Map ApplicationControl.Status to our Status enum
+            status_str = app.Status  # 'Active', 'Fullscreen', 'Visible', etc.
+            try:
+                status = Status(status_str)
+            except ValueError:
+                status = Status.WINDOWLESS
+
+            empty = BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0)
+            # Get bounding box from the main window (if any)
+            if status in (Status.HIDDEN, Status.MINIMIZED, Status.WINDOWLESS):
+                bbox = empty
+            else:
+                main_window = app.MainWindow
+                rect = main_window.BoundingRectangle if main_window else None
+                bbox = (
+                    BoundingBox(
+                        left=int(rect.left),
+                        top=int(rect.top),
+                        right=int(rect.right),
+                        bottom=int(rect.bottom),
+                        width=int(rect.width),
+                        height=int(rect.height),
+                    )
+                    if rect
+                    else empty
+                )
+
+            return Window(
+                name=app_name,
+                is_browser=is_browser,
+                status=status,
+                bounding_box=bbox,
+                pid=pid,
+                bundle_id=bundle_id,
+                dialog=_dialog_view(dialog) if dialog else None,
+            )
+
+        def _describe_pooled(app) -> Optional[Window]:
+            # Worker threads are long-lived; drain PyObjC autoreleases per task.
+            with objc.autorelease_pool():
+                return _describe(app)
+
+        # Each application is several accessibility calls, and the first call to
+        # a process costs far more than later ones because the connection has to
+        # be established. Serially that dominates a cold capture; these are
+        # separate processes, so they answer concurrently.
+        tasks = apps + background_apps
+        if not tasks:
+            return []
+        with ThreadPoolExecutor(
+            max_workers=min(12, len(tasks)), thread_name_prefix="ax-window-scan"
+        ) as pool:
+            described = list(pool.map(_describe_pooled, tasks))
+
+        out = [window for window in described if window is not None]
+        # Register @wN refs serially — RefStore counters are not thread-safe.
+        for w in out:
+            wr = refs.STORE.add_window(
+                element=None,
+                pid=w.pid,
+                title=w.name,
+                geometry={"x": w.bounding_box.left, "y": w.bounding_box.top,
+                          "w": w.bounding_box.width, "h": w.bounding_box.height},
+            )
+            w.ref = wr.ref
+        return out
+
+    def get_screenshot(
+        self,
+        as_bytes: bool = False,
+    ) -> Union[Image.Image, bytes, None]:
+        """
+        Capture a screenshot of the screen using Pillow ImageGrab.
+
+        Args:
+            as_bytes: If True, return PNG bytes.
+
+        Returns:
+            PIL Image, PNG bytes, or None on failure.
+        """
+        try:
+            image = ImageGrab.grab(all_screens=True)
+        except Exception as e:
+            # ImageGrab shells out to screencapture, which intermittently fails
+            # ("could not create image from display") when display state changes
+            # mid-capture — sleep/lock, monitor hot-plug, Space switch — and leaves
+            # an undecodable file that Image.open rejects. Report the failure to the
+            # caller instead of propagating it out of the tool call.
+            logger.error(f"Screenshot capture failed: {e}")
+            return None
+        if as_bytes:
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            return buf.getvalue()
+        return image
+
+    def get_annotated_screenshot(
+        self,
+        nodes: list[TreeElementNode],
+        as_bytes: bool = False,
+        scale: float = 1.0,
+    ) -> Union[Image.Image, bytes, None]:
+        """
+        Take a screenshot and annotate it with numbered bounding boxes for each
+        interactive element. Captures the screenshot internally. Mirrors Windows-MCP.
+
+        Args:
+            nodes: List of TreeElementNode (interactive_nodes from tree state).
+            as_bytes: If True, return PNG bytes; otherwise return PIL Image.
+
+        Returns:
+            Annotated PIL Image, PNG bytes, or None on failure.
+        """
+        img = self.get_screenshot()
+        if img is None:
+            logger.warning(
+                "Screenshot capture failed; returning no annotated screenshot. If this "
+                "persists, check Screen Recording permission in System Settings > "
+                "Privacy & Security."
+            )
+            return None
+        padding = 5
+        width = int(img.width + 1.5 * padding)
+        height = int(img.height + 1.5 * padding)
+        padded = Image.new("RGB", (width, height), color=(255, 255, 255))
+        padded.paste(img, (padding, padding))
+
+        draw = ImageDraw.Draw(padded)
+
+        # Per-display geometry for accurate logical→pixel coordinate mapping.
+        # ImageGrab stitches displays left-to-right in the combined image, each at
+        # its native pixel resolution, so we accumulate pixel_widths to find each
+        # display's pixel origin rather than using a single global scale factor.
+        display_infos = ax.GetPerDisplayInfo()
+        pixel_left_acc = 0
+        for d in display_infos:
+            d["pixel_left"] = pixel_left_acc
+            pixel_left_acc += d["pixel_width"]
+
+        virtual_left = display_infos[0]["logical_left"] if display_infos else 0
+        virtual_top = (
+            min(d["logical_top"] for d in display_infos) if display_infos else 0
+        )
+
+        def _find_display(lx: float, ly: float) -> Optional[dict]:
+            for d in display_infos:
+                if (
+                    d["logical_left"] <= lx < d["logical_left"] + d["logical_width"]
+                    and d["logical_top"] <= ly < d["logical_top"] + d["logical_height"]
+                ):
+                    return d
+            return None
+
+        def _logical_to_pixel(lx: float, ly: float) -> tuple[int, int]:
+            d = _find_display(lx, ly)
+            if d:
+                px = d["pixel_left"] + int((lx - d["logical_left"]) * d["scale"])
+                py = int((ly - d["logical_top"]) * d["scale"])
+                return px, py
+            # Fallback: use average scale across all displays
+            avg_scale = img.width / max(
+                sum(d["logical_width"] for d in display_infos), 1
+            )
+            return int((lx - virtual_left) * avg_scale), int(
+                (ly - virtual_top) * avg_scale
+            )
+
+        # Font sized to main display scale
+        dpi_scale = display_infos[0]["scale"] if display_infos else ax.GetDPIScale()
+        font_size = max(12, int(14 * dpi_scale))
+        try:
+            font_path = "/System/Library/Fonts/Helvetica.ttc"
+            if not os.path.exists(font_path):
+                font_path = "/System/Library/Fonts/Supplemental/Arial.ttf"
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        seen_boxes: set[tuple[int, int, int, int]] = set()
+
+        def draw_annotation(label: int, node: TreeElementNode) -> None:
+            box = node.bounding_box
+            if box.width <= 0 or box.height <= 0:
+                return
+            box_key = (box.left, box.top, box.width, box.height)
+            if box_key in seen_boxes:
+                return
+            seen_boxes.add(box_key)
+
+            # Convert logical coordinates to pixel coordinates using per-display scale
+            cx = (box.left + box.right) / 2
+            cy = (box.top + box.bottom) / 2
+            d = _find_display(cx, cy)
+            if d:
+                s = d["scale"]
+                pl = d["pixel_left"]
+                dl = d["logical_left"]
+                dt = d["logical_top"]
+                x1 = pl + int((box.left - dl) * s) + padding
+                y1 = int((box.top - dt) * s) + padding
+                x2 = pl + int((box.right - dl) * s) + padding
+                y2 = int((box.bottom - dt) * s) + padding
+            else:
+                x1, y1 = _logical_to_pixel(box.left, box.top)
+                x2, y2 = _logical_to_pixel(box.right, box.bottom)
+                x1 += padding
+                y1 += padding
+                x2 += padding
+                y2 += padding
+
+            # Deterministic color per label
+            random.seed(label)
+            color = (
+                random.randint(50, 255),
+                random.randint(50, 255),
+                random.randint(50, 255),
+            )
+
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+            label_text = str(label)
+            try:
+                left, top, right, bottom = draw.textbbox((0, 0), label_text, font=font)
+                text_w, text_h = right - left, bottom - top
+            except Exception:
+                text_w, text_h = len(label_text) * 8, font_size
+
+            # Label above box, or below if no room
+            tag_x1 = x2 - text_w - 4
+            tag_y1 = y1 - text_h - 4
+            if tag_y1 < padding:
+                tag_y1 = y2
+            tag_x2 = tag_x1 + text_w + 4
+            tag_y2 = tag_y1 + text_h + 4
+
+            draw.rectangle([tag_x1, tag_y1, tag_x2, tag_y2], fill=color)
+            draw.text(
+                (tag_x1 + 2, tag_y1 + 2), label_text, font=font, fill=(255, 255, 255)
+            )
+
+        for i, node in enumerate(nodes):
+            draw_annotation(i, node)
+
+        if scale < 1.0 and scale > 0:
+            new_w = max(1, int(padded.width * scale))
+            new_h = max(1, int(padded.height * scale))
+            padded = padded.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+        if as_bytes:
+            buf = io.BytesIO()
+            padded.save(buf, format="PNG")
+            return buf.getvalue()
+        return padded
+
+    # =========================================================================
+    # Async API
+    #
+    # Every async_* method mirrors the sync method of the same name and offloads
+    # its work so that the uvicorn event loop is never blocked.  The sync
+    # methods above hold the actual implementation and remain the single source
+    # of truth.
+    #
+    # async_execute_command uses the native asyncio subprocess API and
+    # async_wait uses asyncio.sleep; the rest delegate to asyncio.to_thread so
+    # that pyobjc / Quartz / Pillow calls (which hold the GIL or do blocking
+    # I/O) run in a thread-pool worker.
+    # =========================================================================
+
+    async def async_execute_command(
+        self,
+        command: str,
+        mode: Literal["shell", "osascript"] = "shell",
+        timeout: int = 10,
+    ) -> Tuple[str, int]:
+        """Async version — uses asyncio subprocess, never blocks the loop."""
+        return await ax.AsyncExecuteCommand(command, mode=mode, timeout=timeout)
+
+    async def async_get_state(
+        self,
+        use_vision: bool = False,
+        as_bytes: bool = False,
+        scale: float = 1.0,
+    ):
+        return await _to_thread_with_autorelease_pool(
+            self.get_state, use_vision, as_bytes, scale
+        )
+
+    async def async_app(
+        self,
+        mode: Literal["launch", "resize", "move", "switch"] = "launch",
+        name: Optional[str] = None,
+        window_loc: Optional[Tuple[int, int]] = None,
+        window_size: Optional[Tuple[int, int]] = None,
+    ) -> str:
+        return await _to_thread_with_autorelease_pool(self.app, mode, name, window_loc, window_size)
+
+    async def async_click(
+        self,
+        loc: Tuple[int, int],
+        button: Literal["left", "right", "middle"] = "left",
+        clicks: int = 1,
+    ) -> None:
+        await _to_thread_with_autorelease_pool(self.click, loc, button, clicks)
+
+    async def async_type(
+        self,
+        loc: Tuple[int, int],
+        text: str,
+        caret_position: Literal["start", "idle", "end"] = "idle",
+        clear: bool = False,
+        press_enter: bool = False,
+    ) -> None:
+        await _to_thread_with_autorelease_pool(
+            self.type, loc, text, caret_position, clear, press_enter
+        )
+
+    async def async_scroll(
+        self,
+        loc: Optional[Tuple[int, int]],
+        scroll_type: Literal["horizontal", "vertical"],
+        direction: Literal["up", "down", "left", "right"],
+        wheel_times: int = 1,
+    ) -> Optional[str]:
+        return await _to_thread_with_autorelease_pool(
+            self.scroll, loc, scroll_type, direction, wheel_times
+        )
+
+    async def async_move(self, loc: Tuple[int, int]) -> None:
+        await _to_thread_with_autorelease_pool(self.move, loc)
+
+    async def async_drag(self, loc: Tuple[int, int]) -> None:
+        await _to_thread_with_autorelease_pool(self.drag, loc)
+
+    async def async_shortcut(self, shortcut: str) -> None:
+        await _to_thread_with_autorelease_pool(self.shortcut, shortcut)
+
+    async def async_wait(self, duration: int) -> None:
+        """Use asyncio.sleep instead of time.sleep to avoid blocking."""
+        await asyncio.sleep(duration)
+
+    async def async_scrape(self, url: str) -> str:
+        return await asyncio.to_thread(self.scrape, url)
+
+    async def async_notify(
+        self,
+        message: str,
+        title: str = "Notification",
+        subtitle: Optional[str] = None,
+        sound: Optional[str] = None,
+    ) -> str:
+        return await asyncio.to_thread(self.notify, message, title, subtitle, sound)
+
+    async def async_create_desktop_space(
+        self,
+        open_delay: float = 0.9,
+        close_after: bool = True,
+    ) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.create_desktop_space, open_delay, close_after
+        )
+
+    async def async_act(self, ref: str, action: str) -> str:
+        return await _to_thread_with_autorelease_pool(self.act, ref, action)
+
+    async def async_click_ref(self, ref: str, button: str, clicks: int) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.click_ref, ref, button, clicks
+        )
+
+    async def async_type_ref(
+        self, ref: str, text: str, clear: bool, press_enter: bool
+    ) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.type_ref, ref, text, clear, press_enter
+        )
+
+    async def async_set_value_ref(self, ref: str, value: str) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.set_value_ref, ref, value
+        )
+
+    async def async_ref_center(self, ref: str) -> Tuple[int, int]:
+        return await _to_thread_with_autorelease_pool(self.ref_center, ref)
+
+    async def async_find_elements(
+        self, role: str, name: str, pid: int, limit: int
+    ) -> list[dict]:
+        return await _to_thread_with_autorelease_pool(
+            self.find_elements, role, name, pid, limit
+        )
+
+    async def async_wait_for(
+        self, ref: str, role: str, name: str, timeout: float
+    ) -> dict:
+        return await _to_thread_with_autorelease_pool(
+            self.wait_for, ref, role, name, timeout
+        )
+
+    async def async_clipboard(self, what, text, image_png, files, get):
+        return await _to_thread_with_autorelease_pool(
+            self.clipboard, what, text, image_png, files, get
+        )
+
+    async def async_find_text(self, needle, case_sensitive, languages):
+        return await _to_thread_with_autorelease_pool(
+            self.find_text, needle, case_sensitive, languages
+        )
