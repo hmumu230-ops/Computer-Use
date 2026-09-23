@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import dataclass
 from macos_mcp.desktop.config import BROWSER_BUNDLE_IDS, SYSTEM_UI_BUNDLE_IDS
 from macos_mcp.desktop.views import Window
+from macos_mcp import refs
 import macos_mcp.ax as ax
 import logging
 import objc
@@ -32,6 +33,11 @@ THREAD_MAX_RETRIES = 3
 # entire rest of the snapshot. Raise it for deeper coverage of a single field;
 # set it to 0 to turn word nodes off entirely.
 MAX_WORD_NODES_PER_ELEMENT = 200
+
+
+def _bbox_dict(bb: BoundingBox) -> dict:
+    """BoundingBox → the {x,y,w,h} shape stored on refs."""
+    return {"x": bb.left, "y": bb.top, "w": bb.width, "h": bb.height}
 
 
 @dataclass
@@ -293,6 +299,7 @@ class Tree:
         scrollable_nodes: list[ScrollElementNode],
         dom_informative_nodes: list[TextElementNode],
         is_browser: bool,
+        app_pid: int = 0,
     ) -> None:
         for window in windows:
             window_rect = window.BoundingRectangle
@@ -308,6 +315,7 @@ class Tree:
                     else None
                 ),
                 is_browser=is_browser,
+                app_pid=app_pid,
             )
 
     def get_nodes(
@@ -347,6 +355,7 @@ class Tree:
         # Default is usually around 6 seconds; 0.5s is plenty for most well-behaved apps.
         ax.SetMessagingTimeout(app.Element, 0.5)
 
+        app_pid = app.PID or 0
         app_name = app.Name or bundle_id
         interactive_nodes: list[TreeElementNode] = []
         scrollable_nodes: list[ScrollElementNode] = []
@@ -361,6 +370,7 @@ class Tree:
                     scrollable_nodes,
                     [],
                     is_browser=is_browser,
+                    app_pid=app_pid,
                 )
             if dialog_only and (dialog := app.Dialog):
                 self._traverse_windows(
@@ -370,6 +380,7 @@ class Tree:
                     scrollable_nodes,
                     dom_informative_nodes,
                     is_browser,
+                    app_pid=app_pid,
                 )
             return interactive_nodes, scrollable_nodes, dom_informative_nodes
 
@@ -390,6 +401,7 @@ class Tree:
                     scrollable_nodes,
                     [],
                     is_browser=is_browser,
+                    app_pid=app_pid,
                 )
             if extras_menubar := app.ExtrasMenuBar:
                 self.tree_traversal(
@@ -399,6 +411,7 @@ class Tree:
                     scrollable_nodes,
                     [],
                     is_browser=is_browser,
+                    app_pid=app_pid,
                 )
         # A sheet or modal dialog blocks the window behind it until it is
         # dismissed. That window stays in the accessibility tree reporting
@@ -413,6 +426,7 @@ class Tree:
                 scrollable_nodes,
                 dom_informative_nodes,
                 is_browser,
+                app_pid=app_pid,
             )
         elif main_window:
             if main_window_rect := main_window.BoundingRectangle:
@@ -426,6 +440,7 @@ class Tree:
                         main_window_rect
                     ),
                     is_browser=is_browser,
+                    app_pid=app_pid,
                 )
         else:
             # MainWindow is None. Distinguish three cases:
@@ -445,6 +460,7 @@ class Tree:
                     scrollable_nodes,
                     dom_informative_nodes,
                     is_browser,
+                    app_pid=app_pid,
                 )
             elif not all_windows:
                 # Some windowless apps (e.g. Spotlight) report their menu bar
@@ -462,6 +478,7 @@ class Tree:
                         scrollable_nodes,
                         dom_informative_nodes,
                         is_browser=is_browser,
+                        app_pid=app_pid,
                     )
         return interactive_nodes, scrollable_nodes, dom_informative_nodes
 
@@ -490,6 +507,7 @@ class Tree:
         interactive_nodes: list[TreeElementNode],
         window_name: str,
         main_window_bounding_box: BoundingBox | None = None,
+        app_pid: int = 0,
     ) -> None:
         """Emit one node per word in a text area, each individually addressable.
 
@@ -530,16 +548,19 @@ class Tree:
                     )
                 if bounding_box.width <= 0 or bounding_box.height <= 0:
                     continue
-                interactive_nodes.append(
-                    TreeElementNode(
-                        bounding_box=bounding_box,
-                        center=bounding_box.get_center(),
-                        name=word,
-                        control_type="Word",
-                        window_name=window_name,
-                        metadata={},
-                    )
+                word_node = TreeElementNode(
+                    bounding_box=bounding_box,
+                    center=bounding_box.get_center(),
+                    name=word,
+                    control_type="Word",
+                    window_name=window_name,
+                    metadata={},
                 )
+                wref = refs.STORE.add_synthetic(
+                    _bbox_dict(bounding_box), word,
+                    metadata={"via": "word_node", "pid": app_pid})
+                word_node.metadata["ref"] = wref.ref
+                interactive_nodes.append(word_node)
             emitted += 1
 
     def _dom_correction(
@@ -657,6 +678,7 @@ class Tree:
         dom_informative_nodes: list[TextElementNode],
         main_window_bounding_box: BoundingBox | None = None,
         is_browser: bool = False,
+        app_pid: int = 0,
     ) -> None:
         """
         Traverse the accessibility tree iteratively and collect interactive and scrollable nodes.
@@ -903,6 +925,14 @@ class Tree:
                 )
                 node = correct(attrs, node, window_name, main_window_bounding_box)
                 if node is not None and len(node.name.strip())>0:
+                    er = refs.STORE.add_element(
+                        element=element,
+                        pid=app_pid,
+                        role=role,
+                        name=node.name,
+                        bbox=_bbox_dict(node.bounding_box),
+                    )
+                    node.metadata["ref"] = er.ref
                     interactive_nodes.append(node)
 
                 # Word-level boxes for text areas. Emitted as their own nodes
@@ -914,6 +944,7 @@ class Tree:
                         interactive_nodes,
                         window_name,
                         main_window_bounding_box,
+                        app_pid=app_pid,
                     )
 
             if role in SCROLLABLE_ROLES and is_visible:
@@ -922,6 +953,13 @@ class Tree:
                 if first_child is not None:
                     child_late = ax.GetLateTraversalBatch(first_child)
                     scroll_label = child_late["label"]
+                sref = refs.STORE.add_element(
+                    element=element,
+                    pid=app_pid,
+                    role=role,
+                    name=scroll_label,
+                    bbox=_bbox_dict(bounding_box),
+                )
                 scrollable_nodes.append(
                     ScrollElementNode(
                         name=scroll_label,
@@ -929,6 +967,7 @@ class Tree:
                         window_name=window_name,
                         bounding_box=bounding_box,
                         center=bounding_box.get_center(),
+                        metadata={"ref": sref.ref},
                     )
                 )
 

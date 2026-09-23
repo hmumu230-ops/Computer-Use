@@ -51,9 +51,10 @@ class Window:
     pid: int
     bundle_id: str
     dialog: Dialog | None = None
+    ref: str = ""
 
     def to_string(self) -> str:
-        line = f"{self.name} ({self.bundle_id}) - {self.status.value}"
+        line = f"{self.ref + ' ' if self.ref else ''}{self.name} ({self.bundle_id}) - {self.status.value}"
         if self.dialog:
             line += f" - {self.dialog.to_string()}"
         return line

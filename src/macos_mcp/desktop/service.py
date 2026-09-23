@@ -4,6 +4,7 @@ from macos_mcp.tree.views import BoundingBox, TreeElementNode
 from PIL import Image, ImageDraw, ImageFont, ImageGrab
 from typing import Literal, Optional, Tuple, Union
 from macos_mcp.tree.service import Tree
+from macos_mcp import refs
 from concurrent.futures import ThreadPoolExecutor
 import macos_mcp.ax as ax
 import asyncio
@@ -49,6 +50,7 @@ class Desktop:
         as_bytes: bool = False,
         scale: float = 1.0,
     ):
+        refs.STORE.new_generation()
         windows = self.get_windows()
         active_window = self.get_foreground_window()
         tree_state = self.tree.get_state(active_window=active_window)
@@ -228,6 +230,266 @@ class Desktop:
         """Drag from current position to target coordinates."""
         start = ax.GetCursorPos()
         ax.DragTo(start[0], start[1], loc[0], loc[1])
+
+    # ------------------------------------------------------------------
+    # @eN element refs / @wN window refs (enhanced fork)
+    # ------------------------------------------------------------------
+
+    def _ax_probe(self, element) -> bool:
+        """Liveness probe for a held AXUIElementRef."""
+        try:
+            return ax.GetElementPid(element) is not None
+        except Exception:
+            return False
+
+    def _ax_search(self, pid: int, role: str, name: str, nth: int):
+        """Re-find an element inside its app by (role, name, nth).
+
+        Names come from the traversal label ladder (title → description →
+        value → placeholder → identifier), so match against all of them.
+        """
+        try:
+            from macos_mcp.ax.controls import ApplicationControl
+
+            app = ApplicationControl(pid=pid)
+        except Exception:
+            return None
+        target = (name or "").casefold()
+
+        def _name_match(ctrl) -> bool:
+            if not target:
+                return True
+            for attr in (
+                ax.Attribute.Title,
+                ax.Attribute.Description,
+                ax.Attribute.Value,
+                ax.Attribute.Identifier,
+            ):
+                v = ax.GetAttribute(ctrl.Element, attr)
+                if v is not None and str(v).casefold() == target:
+                    return True
+            return False
+
+        try:
+            ctrl = ax.Control(
+                searchFromControl=app,
+                role=role or None,
+                predicate=_name_match,
+                foundIndex=nth + 1,
+                searchInterval=0.2,
+            )
+            return ctrl.Element if ctrl.Exists(maxSearchSeconds=1.0) else None
+        except Exception:
+            return None
+
+    def resolve_element(self, ref: str) -> refs.ElementRef:
+        """Resolve @eN → ElementRef with a live (or re-found) element."""
+        return refs.STORE.resolve_element(
+            ref, probe=self._ax_probe, search=self._ax_search
+        )
+
+    def ref_center(self, ref: str) -> Tuple[int, int]:
+        """Resolve @eN/@wN → a click point in screen coordinates."""
+        obj = refs.STORE.get(ref)
+        if isinstance(obj, refs.WindowRef):
+            wr = self.resolve_window(ref)
+            g = wr.geometry or {}
+            return (int(g.get("x", 0) + g.get("w", 0) // 2),
+                    int(g.get("y", 0) + g.get("h", 0) // 2))
+        er = self.resolve_element(ref)
+        if er.element is not None and not er.synthetic:
+            rect = ax.GetRect(er.element)
+            if rect:
+                return (int(rect.center[0]), int(rect.center[1]))
+        bb = er.bbox or {}
+        return (int(bb.get("x", 0) + bb.get("w", 0) // 2),
+                int(bb.get("y", 0) + bb.get("h", 0) // 2))
+
+    def resolve_window(self, ref: str) -> refs.WindowRef:
+        """Resolve @wN → WindowRef, re-binding a live AX window element."""
+        wr = refs.STORE.get(ref)
+        if not isinstance(wr, refs.WindowRef):
+            raise refs.StaleRef(f"{ref} is not a window ref")
+        if wr.element is not None and self._ax_probe(wr.element):
+            return wr
+        try:
+            from macos_mcp.ax.controls import ApplicationControl
+
+            app = ApplicationControl(pid=wr.pid)
+            for w in app.Windows or []:
+                if (w.Name or "") == wr.title:
+                    wr.element = w.Element
+                    return wr
+        except Exception:
+            pass
+        raise refs.StaleRef(
+            f"{ref} ('{wr.title}') no longer resolves",
+            hint="window closed or renamed; take a fresh Snapshot")
+
+    def act(self, ref: str, action: str = "AXPress") -> str:
+        """Semantic AX action on @eN — no coordinates (poka-yoke)."""
+        er = self.resolve_element(ref)
+        if er.synthetic or er.element is None:
+            raise refs.CuError(
+                f"ref {ref} is synthetic — no semantic action",
+                hint="use click with coordinates instead")
+        available = ax.GetActionNames(er.element) or []
+        if action not in available:
+            raise refs.CuError(
+                f"{er.role} does not advertise {action}",
+                hint=f"available: {', '.join(available) or 'none'}")
+        if not ax.PerformAction(er.element, action):
+            raise refs.CuError(f"{action} failed on {ref}")
+        return f"{action} on {ref} ({er.role} '{er.name}')"
+
+    def click_ref(
+        self,
+        ref: str,
+        button: Literal["left", "right", "middle"] = "left",
+        clicks: int = 1,
+    ) -> str:
+        """Pattern-first click: AXPress/AXShowMenu before synthetic coords."""
+        er = self.resolve_element(ref)
+        if not er.synthetic and er.element is not None:
+            actions = ax.GetActionNames(er.element) or []
+            semantic = None
+            if button == "left" and clicks == 1 and "AXPress" in actions:
+                semantic = "AXPress"
+            elif button == "right" and "AXShowMenu" in actions:
+                semantic = "AXShowMenu"
+            if semantic and ax.PerformAction(er.element, semantic):
+                return f"{semantic} on {ref}"
+        x, y = self.ref_center(ref)
+        self.click((x, y), button, clicks)
+        return f"clicked {ref} at ({x},{y})"
+
+    def type_ref(
+        self,
+        ref: str,
+        text: str,
+        clear: bool = False,
+        press_enter: bool = False,
+    ) -> str:
+        """Focus + set AXValue when settable; else coords + key events."""
+        er = self.resolve_element(ref)
+        el = er.element if not er.synthetic else None
+        if el is not None:
+            if ax.IsAttributeSettable(el, ax.Attribute.Focused):
+                ax.SetAttribute(el, ax.Attribute.Focused, True)
+                time.sleep(0.05)
+            if ax.IsAttributeSettable(el, ax.Attribute.Value):
+                if clear:
+                    ax.SetAttribute(el, ax.Attribute.Value, "")
+                ax.SetAttribute(el, ax.Attribute.Value, text)
+                if press_enter:
+                    ax.KeyPress(ax.KeyCode.Return)
+                return f"set AXValue on {ref}"
+        x, y = self.ref_center(ref)
+        self.type((x, y), text, caret_position="idle", clear=clear,
+                  press_enter=press_enter)
+        return f"typed into {ref} at ({x},{y})"
+
+    def set_value_ref(self, ref: str, value: str) -> str:
+        """Set AXValue directly (sliders, text fields, checkboxes)."""
+        er = self.resolve_element(ref)
+        if er.synthetic or er.element is None:
+            raise refs.CuError(f"synthetic ref {ref} has no AXValue")
+        if not ax.IsAttributeSettable(er.element, ax.Attribute.Value):
+            raise refs.CuError(
+                f"AXValue not settable on {ref} ({er.role})",
+                hint="use type/click instead")
+        ax.SetAttribute(er.element, ax.Attribute.Value, value)
+        return f"AXValue set on {ref}"
+
+    def _name_pred(self, name: str):
+        target = (name or "").casefold()
+
+        def _match(ctrl) -> bool:
+            if not target:
+                return True
+            for attr in (
+                ax.Attribute.Title,
+                ax.Attribute.Description,
+                ax.Attribute.Value,
+                ax.Attribute.Identifier,
+            ):
+                v = ax.GetAttribute(ctrl.Element, attr)
+                if v is not None and target in str(v).casefold():
+                    return True
+            return False
+
+        return _match
+
+    def find_elements(
+        self,
+        role: str = "",
+        name: str = "",
+        pid: int = 0,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Live AX search; each hit is registered as a fresh @eN ref."""
+        from macos_mcp.ax.controls import ApplicationControl, _find_recursive_raw
+
+        if not pid:
+            front = ax.GetFrontmostApplication()
+            pid = front.PID if front else 0
+        app = ApplicationControl(pid=pid)
+        hits: list = []
+        _find_recursive_raw(
+            app.Element, hits, role or None, None, None, None,
+            self._name_pred(name), 25, 0, find_first=False,
+        )
+        out = []
+        for el in hits[:limit]:
+            r = ax.GetRect(el)
+            er = refs.STORE.add_element(
+                element=el, pid=pid,
+                role=ax.GetAttribute(el, ax.Attribute.Role) or "",
+                name=name or str(ax.GetAttribute(el, ax.Attribute.Title) or ""),
+                bbox=({"x": int(r.left), "y": int(r.top),
+                       "w": int(r.width), "h": int(r.height)} if r else None),
+            )
+            out.append({"ref": er.ref, "role": er.role, "name": er.name,
+                        "bbox": er.bbox})
+        return out
+
+    def wait_for(
+        self,
+        ref: str = "",
+        role: str = "",
+        name: str = "",
+        timeout: float = 10.0,
+    ) -> dict:
+        """Poll until a ref resolves, or a (role,name) match appears."""
+        deadline = time.time() + timeout
+        hint = refs.STORE.try_get(ref) if ref else None
+        if ref and hint is None:
+            raise refs.StaleRef(
+                f"unknown ref {ref}", hint="refs mint from Snapshot")
+        is_window = isinstance(hint, refs.WindowRef)
+        while True:
+            try:
+                if is_window:
+                    wr = self.resolve_window(ref)
+                    return {"ref": wr.ref, "role": "AXWindow",
+                            "name": wr.title}
+                if ref:
+                    er = self.resolve_element(ref)
+                    return {"ref": er.ref, "role": er.role, "name": er.name}
+                hits = self.find_elements(
+                    role=role, name=name,
+                    pid=hint.pid if hint else 0, limit=1)
+                if hits:
+                    return hits[0]
+            except refs.StaleRef:
+                pass  # dead ref — keep polling; it may resolve again
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                raise refs.CuError(
+                    f"wait_for timed out after {timeout}s",
+                    hint="element never appeared; take a fresh Snapshot")
+            time.sleep(0.4)
 
     def shortcut(self, shortcut: str) -> None:
         """Execute keyboard shortcut (e.g. 'command+c')."""
@@ -447,7 +709,18 @@ class Desktop:
         ) as pool:
             described = list(pool.map(_describe_pooled, tasks))
 
-        return [window for window in described if window is not None]
+        out = [window for window in described if window is not None]
+        # Register @wN refs serially — RefStore counters are not thread-safe.
+        for w in out:
+            wr = refs.STORE.add_window(
+                element=None,
+                pid=w.pid,
+                title=w.name,
+                geometry={"x": w.bounding_box.left, "y": w.bounding_box.top,
+                          "w": w.bounding_box.width, "h": w.bounding_box.height},
+            )
+            w.ref = wr.ref
+        return out
 
     def get_screenshot(
         self,
@@ -741,4 +1014,41 @@ class Desktop:
     ) -> str:
         return await _to_thread_with_autorelease_pool(
             self.create_desktop_space, open_delay, close_after
+        )
+
+    async def async_act(self, ref: str, action: str) -> str:
+        return await _to_thread_with_autorelease_pool(self.act, ref, action)
+
+    async def async_click_ref(self, ref: str, button: str, clicks: int) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.click_ref, ref, button, clicks
+        )
+
+    async def async_type_ref(
+        self, ref: str, text: str, clear: bool, press_enter: bool
+    ) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.type_ref, ref, text, clear, press_enter
+        )
+
+    async def async_set_value_ref(self, ref: str, value: str) -> str:
+        return await _to_thread_with_autorelease_pool(
+            self.set_value_ref, ref, value
+        )
+
+    async def async_ref_center(self, ref: str) -> Tuple[int, int]:
+        return await _to_thread_with_autorelease_pool(self.ref_center, ref)
+
+    async def async_find_elements(
+        self, role: str, name: str, pid: int, limit: int
+    ) -> list[dict]:
+        return await _to_thread_with_autorelease_pool(
+            self.find_elements, role, name, pid, limit
+        )
+
+    async def async_wait_for(
+        self, ref: str, role: str, name: str, timeout: float
+    ) -> dict:
+        return await _to_thread_with_autorelease_pool(
+            self.wait_for, ref, role, name, timeout
         )
