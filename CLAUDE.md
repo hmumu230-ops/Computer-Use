@@ -56,8 +56,13 @@ The project is organized into modular services:
 | `Shortcut` | Press keyboard shortcuts (Cmd+C, etc.) |
 | `Wait` | Pause execution for defined duration |
 | `Snapshot` | Capture desktop state with optional visual annotations; mints `@eN`/`@wN` refs |
+| `FindText` | Vision OCR over the screen; hits mint synthetic `@eN` refs |
+| `Clipboard` | Get/set clipboard payloads: text, image (base64 PNG), file lists |
 | `App` | Launch/manage applications |
 | `Shell` | Execute shell commands or AppleScript (confirm-token gate via `MACOS_MCP_REQUIRE_CONFIRM`) |
+| `System` | System domains: probe/identity/power/display/device/network/audio/env/log |
+| `Process` | List processes or kill by pid (kill is confirm-gated) |
+| `Service` | launchd service list/control (kickstart/enable/disable/bootout, confirm-gated) |
 | `Scrape` | Extract and convert webpage content to Markdown |
 
 ### Enhanced-fork additions (branch `enhanced`)
@@ -72,9 +77,18 @@ The project is organized into modular services:
 - **Safety gate**: `macos_mcp/safety.py` — single-use confirm tokens bound to the action
   digest, 120 s TTL, enabled via `MACOS_MCP_REQUIRE_CONFIRM` (`1`, or comma-separated
   action prefixes like `shell`).
-- Core modules `errors.py`, `refs.py`, `safety.py` are PyObjC-free and unit-testable on
-  any platform; tests/conftest.py skips PyObjC-dependent test files when the frameworks
-  are absent.
+- **Clipboard payloads** (`clipboard.py`): text via pbcopy/pbpaste; image (PNG/TIFF)
+  and file-URL lists via NSPasteboard.
+- **OCR** (`ocr.py`): native Vision `VNRecognizeTextRequest`; `FindText` mints synthetic
+  refs with Retina physical→logical scale correction.
+- **System toolkit** (`system.py`): subprocess-only domains (probe/identity/process/
+  launchd/audio/network/display/device/power/env/log); destructive writes are
+  confirm-gated.
+- **Direct CLI**: `macos-mcp doctor` (env/framework/TCC diagnosis), `macos-mcp tools`,
+  `macos-mcp call <Tool> --arg k=v`.
+- Core modules `errors.py`, `refs.py`, `safety.py`, `clipboard.py` (text path),
+  `ocr.py`, `system.py` are PyObjC-free and unit-testable on any platform;
+  tests/conftest.py skips PyObjC-dependent test files when the frameworks are absent.
 
 ## Development Guidelines
 
