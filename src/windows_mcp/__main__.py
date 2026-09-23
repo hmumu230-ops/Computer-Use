@@ -1060,9 +1060,18 @@ def _parse_call_args(pairs: list[str]) -> dict:
     return kwargs
 
 
+def _utf8_stdout() -> None:
+    """Tool output may contain arbitrary Unicode from window titles/UI text —
+    a legacy-codepage console (e.g. GBK) must not crash the CLI on it."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
 def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
     """Print a tool result; Image payloads are written to PNG files."""
     import json as _json
+
+    _utf8_stdout()
 
     items = result if isinstance(result, list) else [result]
     out = []
@@ -1096,6 +1105,8 @@ def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
 def list_tools(json_out: bool) -> None:
     """List the registered tool names and descriptions."""
     import json as _json
+
+    _utf8_stdout()
 
     mcp = _build_mcp()
     registry = _tool_registry(mcp)
