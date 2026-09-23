@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [enhanced, main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest tests/unit tests/protocol -x -q
+
+  xvfb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: install GUI stack
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb openbox dbus-x11 at-spi2-core \
+            python3-gi gir1.2-atspi-2.0 xdotool wmctrl scrot xclip \
+            gnome-calculator gedit
+      - name: xvfb lane (skips cleanly when AT-SPI unavailable)
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x800x24 &
+          sleep 1
+          openbox &
+          sleep 1
+          dbus-run-session -- sh -c '
+            /usr/libexec/at-spi2-registryd & 2>/dev/null || \
+            /usr/lib/at-spi2-core/at-spi2-registryd &
+            sleep 1
+            python -m pytest tests/ -m "xvfb or not mark" -x -q'

@@ -5,8 +5,17 @@
 <h1 align="center">linux-computer-use</h1>
 
 <p align="center">
-  <em>Linux/X11 computer-use tools for AI agents — Pi, Claude Code, OpenCode, and any MCP-aware client. AT-SPI + xdotool, ~1k LOC.</em>
+  <em>Linux computer-use tools for AI agents — X11 + Wayland. AT-SPI semantic actions, generation-scoped refs, OCR fallback, clipboard, notifications, and a gated system toolkit.</em>
 </p>
+
+> **enhanced fork** — this branch (`enhanced`) extends the upstream
+> X11-only 8-tool bridge into a cross-environment toolkit: ~35 MCP tools,
+> Wayland compositor backends (GNOME/KDE/sway/Hyprland/niri/Wayfire/
+> foreign-toplevel), input injection routing (xdotool / ydotool / dotool /
+> evdev-uinput / RemoteDesktop portal), tiered OCR (AT-SPI → tesseract →
+> rapidocr), confirm-token safety gates, and a `doctor`/`setup`/`call` CLI.
+> See `docs/ACCEPTANCE.md` and `docs/TESTING.md` for the verification status —
+> several Wayland paths are implemented but pending real-machine validation.
 
 <p align="center">
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/tak-uukti/linux-computer-use?style=flat-square"></a>
