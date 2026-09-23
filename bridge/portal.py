@@ -289,3 +289,93 @@ def rd_keycode(keycode: int, down: bool) -> None:
 def rd_keysym(keysym: int, down: bool) -> None:
     _rd_call("NotifyKeyboardKeysym", "(oa{sv}iu)",
              (int(keysym), 1 if down else 0))
+
+
+# ---------- ScreenCast + PipeWire (persistent high-frequency capture) ----------
+
+SC_IFACE = "org.freedesktop.portal.ScreenCast"
+
+_SC: dict | None = None       # {"session", "node_id", "fd", "bus"}
+_SC_BROKEN = False
+
+
+def sc_available() -> bool:
+    if _SC_BROKEN:
+        return False
+    return portal_available()
+
+
+def sc_session(timeout: int = 60) -> dict:
+    """Lazily establish one ScreenCast session for the bridge lifetime.
+
+    persist_mode=2 + restore_token: first call consents, later calls
+    (and later bridge runs) are silent. Returns {"fd", "node_id"} ready
+    for a GStreamer pipewiresrc."""
+    global _SC, _SC_BROKEN
+    if _SC is not None:
+        return _SC
+    try:
+        Gio, GLib = _gio()
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        sess_tok = f"lcsc{uuid.uuid4().hex[:10]}"
+        res = call_portal(SC_IFACE, "CreateSession", (),
+                          {"session_handle_token": sess_tok}, timeout=timeout)
+        session = res.get("session_handle")
+        if not session:
+            sender = bus.get_unique_name()[1:].replace(".", "_")
+            session = (f"/org/freedesktop/portal/desktop/session/"
+                       f"{sender}/{sess_tok}")
+        src_opts: dict = {"types": 1, "multiple": False, "persist_mode": 2}
+        token = _rd_load_token()
+        if token:
+            src_opts["restore_token"] = token
+        call_portal(SC_IFACE, "SelectSources", (session,), src_opts,
+                    timeout=timeout)
+        res = call_portal(SC_IFACE, "Start", (session, ""), {}, timeout=timeout)
+        streams = res.get("streams") or []
+        if not streams:
+            raise CuError("ScreenCast returned no streams")
+        if res.get("restore_token"):
+            _rd_save_token(str(res["restore_token"]))
+        # OpenPipeWireRemote is a direct (non-Request) method returning fd h.
+        ret, fdlist = bus.call_with_unix_fd_list_sync(
+            PORTAL, DESKTOP_PATH, SC_IFACE, "OpenPipeWireRemote",
+            GLib.Variant("(oa{sv})", (session, {})),
+            GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, -1, None, None)
+        fd_index = ret.unpack()[0]
+        fd = fdlist.get(fd_index)
+        _SC = {"session": session, "node_id": int(streams[0][0]),
+               "fd": fd, "bus": bus}
+        return _SC
+    except Exception:
+        _SC_BROKEN = True
+        raise
+
+
+def sc_frame_png(path: str, timeout: int = 15) -> dict:
+    """Grab one frame from the PipeWire stream via GStreamer → PNG at `path`.
+
+    pipewiresrc num-buffers=1 emits a single buffer then EOS."""
+    sc = sc_session()
+    import gi
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+    Gst.init(None)
+    if Gst.ElementFactory.find("pipewiresrc") is None:
+        raise CuError("gst-plugin-pipewire missing",
+                      hint="install gstreamer1.0-pipewire")
+    launch = (f"pipewiresrc fd={sc['fd']} path={sc['node_id']} num-buffers=1 "
+              f"! videoconvert ! pngenc ! filesink location={path}")
+    pipe = Gst.parse_launch(launch)
+    pipe.set_state(Gst.State.PLAYING)
+    bus = pipe.get_bus()
+    msg = bus.timed_pop_filtered(
+        timeout * Gst.SECOND,
+        Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    pipe.set_state(Gst.State.NULL)
+    if msg is None:
+        raise CuError("pipewire frame grab timed out")
+    if msg.type == Gst.MessageType.ERROR:
+        err, _dbg = msg.parse_error()
+        raise CuError(f"pipewire frame grab failed: {err.message}")
+    return {"path": path, "node_id": sc["node_id"]}

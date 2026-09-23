@@ -41,8 +41,9 @@ exec ${py} ${JSON.stringify(bridgePy)} "$@"
 	}
 	if (missing.length) {
 		console.warn(
-			`[pcul] missing system deps: ${missing.join(", ")}.\n` +
-			`        sudo apt-get install -y python3 python3-gi gir1.2-atspi-2.0 xdotool wmctrl scrot`,
+			`[pcul] missing baseline deps: ${missing.join(", ")}.\n` +
+			`        sudo apt-get install -y python3 python3-gi gir1.2-atspi-2.0\n` +
+			`        X11: xdotool wmctrl scrot xclip | Wayland: ydotool wl-clipboard grim`,
 		);
 	}
 }

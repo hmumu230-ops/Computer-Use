@@ -112,10 +112,17 @@ def capture(region: dict | None = None,
                     "no Wayland screenshot backend",
                     compositor=comp,
                     hint="install grim (wlroots) or xdg-desktop-portal")
-            src = portal.screenshot_path()
-            import shutil
-            shutil.copyfile(src, path)
-            backend_used = "portal"
+            try:
+                # Preferred: persistent ScreenCast+PipeWire session — one
+                # consent, then silent high-frequency frames.
+                portal.sc_frame_png(path)
+                backend_used = "pipewire"
+            except CuError:
+                # Fallback: per-call portal Screenshot (own consent path).
+                src = portal.screenshot_path()
+                import shutil
+                shutil.copyfile(src, path)
+                backend_used = "portal"
         # Wayland captures are physical px; compute scale for logical crop
         lw, _lh = _logical_screen_size()
         iw, _ih = _png_size(path)
