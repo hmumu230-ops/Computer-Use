@@ -1,10 +1,12 @@
 """tools subpackage — registers all MCP tool definitions on a FastMCP instance."""
 
 from windows_mcp.tools import (
+    admin,
     app,
     clipboard,
     display,
     filesystem,
+    hardware,
     input,
     multi,
     notification,
@@ -14,6 +16,7 @@ from windows_mcp.tools import (
     scrape,
     shell,
     snapshot,
+    system,
 )
 
 _MODULES = [
@@ -30,6 +33,9 @@ _MODULES = [
     notification,
     registry,
     ocr,
+    system,
+    hardware,
+    admin,
 ]
 
 

@@ -29,6 +29,7 @@ dependencies = [
     "platformdirs>=4.3.8",
     "posthog>=7.4.0",
     "psutil>=7.0.0",
+    "pycaw>=20220416",
     "pygments>=2.20.0",
     "python-levenshtein>=0.27.1",
     "pywin32>=311",

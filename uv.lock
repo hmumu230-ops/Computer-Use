@@ -1105,6 +1105,19 @@ memory = [
 ]
 
 [[package]]
+name = "pycaw"
+version = "20260921"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "comtypes" },
+    { name = "psutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/a3/49077ccfeddd0d6bcd05a384792b19df34d840dbf6ca7f306c4e312a2fb6/pycaw-20260921.tar.gz", hash = "sha256:48decedfbb5e0654d983b6b1876b4cef14dbfe62c943d7c8d8370fe343f95901", size = 27384, upload-time = "2026-09-21T20:59:05.972Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/a1/3ef4af478c1766a964b71447719146a2289d2969368fd40f48e31b6016d4/pycaw-20260921-py3-none-any.whl", hash = "sha256:f75128111d99195e5fe4f08f0bbd36d36cede1b339c6a8441f81bfd19379571d", size = 27553, upload-time = "2026-09-21T20:59:04.929Z" },
+]
+
+[[package]]
 name = "pyclipper"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1905,6 +1918,7 @@ dependencies = [
     { name = "platformdirs" },
     { name = "posthog" },
     { name = "psutil" },
+    { name = "pycaw" },
     { name = "pygments" },
     { name = "python-levenshtein" },
     { name = "pywin32" },
@@ -1936,6 +1950,7 @@ requires-dist = [
     { name = "platformdirs", specifier = ">=4.3.8" },
     { name = "posthog", specifier = ">=7.4.0" },
     { name = "psutil", specifier = ">=7.0.0" },
+    { name = "pycaw", specifier = ">=20220416" },
     { name = "pygments", specifier = ">=2.20.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },

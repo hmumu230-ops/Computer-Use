@@ -45,14 +45,22 @@ pytestmark = pytest.mark.skipif(
 # guard on the tool surface: adding or renaming a tool must update this list.
 EXPECTED_TOOLS = {
     "App",
+    "Audio",
     "Click",
     "Clipboard",
+    "Device",
+    "DevMode",
+    "Display",
     "DisplayInventory",
+    "Env",
+    "EventLog",
     "FileSystem",
     "FindText",
+    "Identity",
     "Move",
     "MultiEdit",
     "MultiSelect",
+    "Network",
     "Notification",
     "PowerShell",
     "Process",
@@ -60,11 +68,15 @@ EXPECTED_TOOLS = {
     "Scrape",
     "Screenshot",
     "Scroll",
+    "Service",
     "Shortcut",
     "Snapshot",
+    "System",
+    "Task",
     "Type",
     "Wait",
     "WaitFor",
+    "Window",
 }
 
 # Generous enough for a cold interpreter start on CI, short enough to fail
