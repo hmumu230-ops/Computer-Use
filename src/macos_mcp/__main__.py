@@ -1340,6 +1340,13 @@ def doctor() -> None:
                f"see FAIL lines above.")
 
 
+def _utf8_stdout() -> None:
+    """Tool output may contain arbitrary Unicode from window titles/UI text —
+    a legacy-codepage console must not crash the CLI on it."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
 def _tool_registry() -> dict:
     """Name → Tool map across FastMCP versions (private API fallback chain)."""
     tool_mgr = getattr(mcp, "_tool_manager", None)
@@ -1372,6 +1379,7 @@ def _parse_call_args(pairs: list[str]) -> dict:
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
 def list_tools(json_out: bool) -> None:
     """List the registered tool names and descriptions."""
+    _utf8_stdout()
     rows = []
     for name, tool in sorted(_tool_registry().items()):
         desc = (getattr(tool, "description", "") or "").split("\n")[0][:120]
@@ -1423,6 +1431,7 @@ def call_tool(tool_name: str, pairs: tuple[str, ...], json_out: bool,
         desktop = Desktop()
         screen_size = desktop.get_screen_size()
 
+    _utf8_stdout()
     fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
     result = fn(**kwargs)
     if asyncio.iscoroutine(result):
