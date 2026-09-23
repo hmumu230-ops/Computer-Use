@@ -6,6 +6,8 @@ adds zero dependencies. Portal calls are async (Request::Response signal);
 """
 from __future__ import annotations
 
+import json
+import os
 import urllib.parse
 import uuid
 
@@ -109,6 +111,7 @@ def _sig_for(method: str) -> str:
         "Screenshot": "(sa{sv})",
         "PickColor": "(sa{sv})",
         "CreateSession": "(a{sv})",
+        "SelectDevices": "(oa{sv})",
         "SelectSources": "(oa{sv})",
         "Start": "(osa{sv})",
         "OpenPipeWireRemote": "(oa{sv})",
@@ -143,3 +146,146 @@ def preseed_screenshot_permission() -> bool:
         return True
     except Exception:
         return False
+
+
+# ---------- RemoteDesktop (GNOME/KDE Wayland input injection) ----------
+
+RD_IFACE = "org.freedesktop.portal.RemoteDesktop"
+RD_KEYBOARD = 1
+RD_POINTER = 2
+RD_TOUCHSCREEN = 4
+RD_AXIS_VERTICAL = 0
+RD_AXIS_HORIZONTAL = 1
+
+_RD: dict | None = None       # {"session", "stream", "bus"}
+_RD_BROKEN = False            # set once session creation/notify fails hard
+
+
+def _rd_token_file() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "linux-computer-use", "rd_token.json")
+
+
+def _rd_load_token() -> str | None:
+    try:
+        with open(_rd_token_file(), encoding="utf-8") as fh:
+            return json.load(fh).get("restore_token")
+    except Exception:
+        return None
+
+
+def _rd_save_token(token: str) -> None:
+    try:
+        path = _rd_token_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"restore_token": token}, fh)
+    except Exception:
+        pass
+
+
+def rd_available() -> bool:
+    """True when a RemoteDesktop portal backend plausibly exists.
+
+    Only GNOME/KDE-class portals implement RemoteDesktop today;
+    xdg-desktop-portal-wlr does not."""
+    if _RD_BROKEN:
+        return False
+    return portal_available()
+
+
+def rd_session(timeout: int = 60) -> dict:
+    """Lazily establish one RemoteDesktop session for the bridge lifetime.
+
+    First call may show a consent dialog; persist_mode=2 + a stored
+    restore_token make subsequent calls (and later bridge runs) silent.
+    """
+    global _RD, _RD_BROKEN
+    if _RD is not None:
+        return _RD
+    try:
+        Gio, _ = _gio()
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        sess_tok = f"lcus{uuid.uuid4().hex[:10]}"
+        res = call_portal(RD_IFACE, "CreateSession", (),
+                          {"session_handle_token": sess_tok}, timeout=timeout)
+        session = res.get("session_handle")
+        if not session:
+            sender = bus.get_unique_name()[1:].replace(".", "_")
+            session = (f"/org/freedesktop/portal/desktop/session/"
+                       f"{sender}/{sess_tok}")
+        call_portal(RD_IFACE, "SelectDevices", (session,),
+                    {"types": RD_KEYBOARD | RD_POINTER}, timeout=timeout)
+        src_opts: dict = {"types": 1, "multiple": False, "persist_mode": 2}
+        token = _rd_load_token()
+        if token:
+            src_opts["restore_token"] = token
+        call_portal(RD_IFACE, "SelectSources", (session,), src_opts,
+                    timeout=timeout)
+        res = call_portal(RD_IFACE, "Start", (session, ""), {}, timeout=timeout)
+        streams = res.get("streams") or []
+        if not streams:
+            raise CuError("RemoteDesktop returned no streams",
+                          hint="cannot place absolute pointer without a stream")
+        if res.get("restore_token"):
+            _rd_save_token(str(res["restore_token"]))
+        _RD = {"session": session, "stream": int(streams[0][0]), "bus": bus}
+        return _RD
+    except Exception:
+        _RD_BROKEN = True
+        raise
+
+
+def rd_close() -> None:
+    global _RD
+    if _RD is None:
+        return
+    try:
+        Gio, _ = _gio()
+        _RD["bus"].call_sync(PORTAL, _RD["session"],
+                             "org.freedesktop.portal.Session", "Close",
+                             None, None, Gio.DBusCallFlags.NONE, -1, None)
+    except Exception:
+        pass
+    _RD = None
+
+
+def _rd_call(method: str, sig: str, tail: tuple) -> None:
+    global _RD_BROKEN
+    try:
+        rd = rd_session()
+        Gio, GLib = _gio()
+        rd["bus"].call_sync(
+            PORTAL, DESKTOP_PATH, RD_IFACE, method,
+            GLib.Variant(sig, (rd["session"], {}, *tail)),
+            None, Gio.DBusCallFlags.NONE, -1, None)
+    except CuError:
+        raise
+    except Exception as exc:
+        _RD_BROKEN = True
+        raise CuError(f"RemoteDesktop {method} failed: {exc}") from exc
+
+
+def rd_pointer_move_abs(x: float, y: float) -> None:
+    _rd_call("NotifyPointerMotionAbsolute", "(oa{sv}udd)",
+             (rd_session()["stream"], float(x), float(y)))
+
+
+def rd_pointer_button(button: int, down: bool) -> None:
+    _rd_call("NotifyPointerButton", "(oa{sv}iu)",
+             (int(button), 1 if down else 0))
+
+
+def rd_axis_discrete(axis: int, steps: int) -> None:
+    _rd_call("NotifyPointerAxisDiscrete", "(oa{sv}ui)",
+             (int(axis), int(steps)))
+
+
+def rd_keycode(keycode: int, down: bool) -> None:
+    _rd_call("NotifyKeyboardKeycode", "(oa{sv}iu)",
+             (int(keycode), 1 if down else 0))
+
+
+def rd_keysym(keysym: int, down: bool) -> None:
+    _rd_call("NotifyKeyboardKeysym", "(oa{sv}iu)",
+             (int(keysym), 1 if down else 0))

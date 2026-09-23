@@ -1,3 +1,8 @@
-# Uses system PyGObject. Install via apt:
-#   sudo apt-get install -y python3-gi gir1.2-atspi-2.0 xdotool wmctrl scrot
-# No pip dependencies required.
+# Uses system PyGObject + distro tools. Debian/Ubuntu baseline:
+#   sudo apt-get install -y python3-gi gir1.2-atspi-2.0
+# X11 session:   xdotool wmctrl scrot xclip
+# Wayland input: ydotool (or python3-evdev + uinput rule); GNOME/KDE can use
+#                the RemoteDesktop portal after a one-time consent.
+# Wayland shot:  xdg-desktop-portal (gnome|kde|wlr) + grim / spectacle
+# Extras:        wl-clipboard xclip xsel notify-send tesseract-ocr
+# Optional pip (OCR tier-2): rapidocr

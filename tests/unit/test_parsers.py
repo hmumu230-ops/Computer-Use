@@ -201,3 +201,36 @@ def test_proc_kill_gated(monkeypatch):
     monkeypatch.setenv("LINUX_MCP_REQUIRE_CONFIRM", "dangerous")
     with pytest.raises(ConfirmRequired):
         syscore.proc_kill(1234)
+
+
+# ---------- inject portal helpers ----------
+
+class TestPortalHelpers:
+    def test_keysym_ascii(self):
+        import inject
+        assert inject._keysym("a") == ord("a")
+        assert inject._keysym(" ") == 0x20
+
+    def test_keysym_special_and_unicode(self):
+        import inject
+        assert inject._keysym("\n") == 0xFF0D
+        assert inject._keysym("中") == 0x01000000 | ord("中")
+
+    def test_portal_key_events_chord(self):
+        import inject
+        ev = inject._portal_key_events("ctrl+a")
+        assert ev == [(29, True), (30, True), (30, False), (29, False)]
+
+    def test_portal_key_events_named(self):
+        import inject
+        assert inject._portal_key_events("enter") == [(28, True), (28, False)]
+
+    def test_mode_prefers_portal_on_gnome(self, monkeypatch):
+        import inject
+        monkeypatch.setattr(inject, "_PORTAL_OK", None)
+        monkeypatch.setattr(inject.detect, "detect_env",
+                            lambda: type("E", (), {"session_type": "wayland",
+                                                   "compositor": "gnome"})())
+        monkeypatch.setattr(inject, "which", lambda _: None)
+        monkeypatch.setattr(inject, "_portal_ok", lambda: True)
+        assert inject._mode() == "portal"

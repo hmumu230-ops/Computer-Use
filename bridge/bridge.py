@@ -493,7 +493,7 @@ def cmd_drag(req):
     else:
         x1 = int(req.get("x1")); y1 = int(req.get("y1"))
         x2 = int(req.get("x2")); y2 = int(req.get("y2"))
-    inject.drag(x1, y1, x2, y2)
+    inject.drag(x1, y1, x2, y2, req.get("button", "left"))
     return {"from": [x1, y1], "to": [x2, y2]}
 
 

@@ -1,9 +1,9 @@
 """Input-injection router.
 
 X11     → xdotool (status quo)
-Wayland → ydotool/dotool (uinput daemons) → python-evdev uinput →
-          wtype (wlroots text) → portal RemoteDesktop (GNOME consent) →
-          honest UNSUPPORTED when nothing is available.
+Wayland → ydotool/dotool (uinput daemons) → portal RemoteDesktop
+          (GNOME/KDE, one-time consent + restore_token) → python-evdev
+          uinput → wtype (wlroots text) → honest UNSUPPORTED.
 
 Note: AT-SPI generate_*_event uses XTEST internally — X11 only, kept as a
 last-resort X11 path in a11y.py.
@@ -18,6 +18,25 @@ from util import run, run_out, which
 
 _UINPUT_DELAY = 0.7   # uinput devices need settle time after creation
 
+# Compositors whose portal implements RemoteDesktop (wlr portal does not).
+_RD_COMPOSITORS = {"gnome", "kde", "cosmic", "pantheon", "budgie"}
+_PORTAL_OK: bool | None = None
+
+
+def _portal_ok() -> bool:
+    global _PORTAL_OK
+    if _PORTAL_OK is None:
+        try:
+            env = detect.detect_env()
+            if env.compositor in _RD_COMPOSITORS:
+                import portal
+                _PORTAL_OK = portal.rd_available()
+            else:
+                _PORTAL_OK = False
+        except Exception:
+            _PORTAL_OK = False
+    return _PORTAL_OK
+
 
 def _mode() -> str:
     env = detect.detect_env()
@@ -27,6 +46,8 @@ def _mode() -> str:
         return "ydotool"
     if which("dotool"):
         return "dotool"
+    if _portal_ok():
+        return "portal"
     try:
         import evdev  # noqa: F401
         return "evdev"
@@ -53,6 +74,8 @@ def mouse_move(x: int, y: int) -> None:
              str(int(x)), str(int(y))], timeout=5)
     elif m == "dotool":
         _dotool(f"mousemove {int(x)} {int(y)}\n")
+    elif m == "portal":
+        _pt().rd_pointer_move_abs(x, y)
     elif m == "evdev":
         _evdev_abs(int(x), int(y))
     else:
@@ -78,6 +101,12 @@ def mouse_click(x: int | None, y: int | None, button: str = "left",
     elif m == "dotool":
         b = {"1": "left", "2": "middle", "3": "right"}[btn]
         _dotool(f"click {b}\n" * max(1, int(count)))
+    elif m == "portal":
+        code = {"1": 0x110, "2": 0x112, "3": 0x111}[btn]
+        for _ in range(max(1, int(count))):
+            _pt().rd_pointer_button(code, True)
+            _pt().rd_pointer_button(code, False)
+            time.sleep(0.02)
     elif m == "evdev":
         _evdev_click(btn, count)
     else:
@@ -104,6 +133,12 @@ def scroll(x: int | None, y: int | None, dx: int, dy: int) -> None:
     elif m == "dotool":
         acts = ("wheeldown" if dy > 0 else "wheelup")
         _dotool(f"{acts}\n" * ticks_y)
+    elif m == "portal":
+        p = _pt()
+        if dy:
+            p.rd_axis_discrete(p.RD_AXIS_VERTICAL, ticks_y if dy > 0 else -ticks_y)
+        if dx:
+            p.rd_axis_discrete(p.RD_AXIS_HORIZONTAL, ticks_x if dx > 0 else -ticks_x)
     elif m == "evdev":
         _evdev_scroll(dx, dy)
     else:
@@ -123,7 +158,7 @@ def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> None:
             run(["xdotool", "mousemove", str(xi), str(yi)])
             time.sleep(0.02)
         run(["xdotool", "mouseup", "1"])
-    elif m in ("ydotool", "dotool", "evdev"):
+    elif m in ("ydotool", "dotool", "evdev", "portal"):
         mouse_move(x1, y1)
         _press(button, down=True)
         for i in range(1, steps + 1):
@@ -146,6 +181,9 @@ def _press(button: str, down: bool) -> None:
     elif m == "dotool":
         b = {"left": "left", "middle": "middle", "right": "right"}[button]
         _dotool(f"mousedown {b}\n" if down else f"mouseup {b}\n")
+    elif m == "portal":
+        code = {"left": 0x110, "middle": 0x112, "right": 0x111}[button]
+        _pt().rd_pointer_button(code, down)
     elif m == "evdev":
         _evdev_btn(button, down)
 
@@ -191,6 +229,11 @@ def keypress(keys: list[str]) -> None:
     elif m == "dotool":
         for k in keys:
             _dotool(f"key {_dotool_keyname(k)}\n")
+    elif m == "portal":
+        for k in keys:
+            for code, down in _portal_key_events(k):
+                _pt().rd_keycode(code, down)
+            time.sleep(0.02)
     elif m == "evdev":
         for k in keys:
             _evdev_key(k)
@@ -211,6 +254,8 @@ def type_text(text: str, delay_ms: int = 8) -> None:
     elif m == "wtype":
         run(["wtype", "--", text],
             timeout=max(10, len(text) * delay_ms / 1000 + 10))
+    elif m == "portal":
+        _portal_type(text, delay_ms)
     elif m == "evdev":
         _evdev_type(text, delay_ms)
     else:
@@ -403,10 +448,51 @@ def _evdev_type(text: str, delay_ms: int) -> None:
         ui.close()
 
 
+# ---------- portal RemoteDesktop ----------
+
+def _pt():
+    import portal
+    return portal
+
+
+def _portal_key_events(token: str) -> list[tuple[int, bool]]:
+    """'ctrl+a' → [(29,True),(30,True),(30,False),(29,False)].
+
+    Reuses the ydotool spec strings ("29:1") as the keycode source."""
+    events = []
+    for spec in _ydo_keyspec(token):
+        for item in spec:
+            code, state = item.split(":")
+            events.append((int(code), state == "1"))
+    return events
+
+
+_XKEYSYM = {"\n": 0xFF0D, "\r": 0xFF0D, "\t": 0xFF09, "\x1b": 0xFF1B,
+            "\b": 0xFF08, "\x7f": 0xFFFF}
+
+
+def _keysym(ch: str) -> int:
+    if ch in _XKEYSYM:
+        return _XKEYSYM[ch]
+    cp = ord(ch)
+    if 0x20 <= cp <= 0x7E or 0xA0 <= cp <= 0xFF:
+        return cp                      # Latin-1 keysyms equal codepoints
+    return 0x01000000 | cp             # X keysym Unicode extension
+
+
+def _portal_type(text: str, delay_ms: int) -> None:
+    p = _pt()
+    for ch in text:
+        sym = _keysym(ch)
+        p.rd_keysym(sym, True)
+        p.rd_keysym(sym, False)
+        time.sleep(delay_ms / 1000)
+
+
 def _no_input(op: str) -> CuError:
     env = detect.detect_env()
     return UnsupportedCompositor(
         f"no input-injection backend for {op} on {env.session_type}/{env.compositor}",
         compositor=env.compositor,
-        hint="install ydotool (uinput daemon) or run on X11; GNOME can use "
+        hint="install ydotool (uinput daemon) or run on X11; GNOME/KDE can use "
              "the RemoteDesktop portal after consent")

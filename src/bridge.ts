@@ -100,15 +100,39 @@ export function stopBridge(): void {
 	rejectAll(new Error("bridge stopped"));
 }
 
-// Typed wrappers
+// Typed wrappers — arg names mirror bridge/bridge.py command handlers.
+export const capabilities = () => send("capabilities");
+export const probe = () => send("probe");
 export const listWindows = () => send("list_windows");
-export const screenshot = (opts: { window?: string } = {}) => send("screenshot", opts);
-export const click = (opts: { ref?: string; x?: number; y?: number; button?: string; clickCount?: number }) => send("click", opts);
-export const typeText = (opts: { text: string }) => send("type_text", opts);
+export const windowFocus = (opts: { ref: string }) => send("window_focus", opts);
+export const windowClose = (opts: { ref: string; confirmToken?: string }) => send("window_close", opts);
+export const windowMove = (opts: { ref: string; x?: number; y?: number; w?: number; h?: number }) => send("window_move", opts);
+export const windowState = (opts: { ref: string; state: string; on?: boolean }) => send("window_state", opts);
+export const desktops = () => send("desktops");
+export const switchDesktop = (opts: { index: number }) => send("switch_desktop", opts);
+export const windowToDesktop = (opts: { ref: string; index: number }) => send("window_to_desktop", opts);
+export const cursorPos = () => send("cursor_pos");
+export const snapshot = (opts: { window?: string; region?: any; tree?: boolean; pid?: number } = {}) => send("snapshot", opts);
+export const screenshot = (opts: { window?: string; region?: any } = {}) => send("screenshot", opts);
+export const findElements = (opts: { role?: string; name?: string; states?: string[]; limit?: number; pid?: number }) => send("find_elements", opts);
+export const findText = (opts: { text: string; region?: any; limit?: number }) => send("find_text", opts);
+export const waitFor = (opts: { role?: string; name?: string; event?: string; timeout?: number }) => send("wait_for", opts);
+export const waitForText = (opts: { text: string; timeout?: number }) => send("wait_for_text", opts);
+export const act = (opts: { ref: string; verb?: string }) => send("act", opts);
+export const click = (opts: { ref?: string; x?: number; y?: number; button?: string; clickCount?: number; method?: string }) => send("click", opts);
+export const typeText = (opts: { text: string; delayMs?: number }) => send("type_text", opts);
 export const setText = (opts: { ref: string; text: string }) => send("set_text", opts);
+export const setValue = (opts: { ref: string; value: number }) => send("set_value", opts);
+export const select = (opts: { ref: string; index: number }) => send("select", opts);
 export const keypress = (opts: { keys: string[] }) => send("keypress", opts);
 export const scroll = (opts: { ref?: string; x?: number; y?: number; scrollY?: number; scrollX?: number }) => send("scroll", opts);
-export const computerActions = (opts: { actions: any[] }) => send("computer_actions", opts);
+export const moveMouse = (opts: { ref?: string; x?: number; y?: number }) => send("move_mouse", opts);
+export const drag = (opts: { from?: string; to?: string; x1?: number; y1?: number; x2?: number; y2?: number; button?: string }) => send("drag", opts);
+export const computerActions = (opts: { actions: any[]; failFast?: boolean }) => send("computer_actions", opts);
+export const clipboardGet = (opts: { what?: string } = {}) => send("clipboard_get", opts);
+export const clipboardSet = (opts: { text?: string; pngBase64?: string; files?: string[] }) => send("clipboard_set", opts);
+export const notify = (opts: { title: string; body?: string; urgency?: string; icon?: string; timeoutMs?: number }) => send("notify", opts);
+export const launchApp = (opts: { target: string }) => send("launch_app", opts);
 
 // Format helper for tool results
 import type { AgentToolResult } from "./types.ts";
