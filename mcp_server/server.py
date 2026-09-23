@@ -525,6 +525,10 @@ def _split_image(res):
 # ---------- CLI ----------
 
 def _cli() -> int:
+    # Tool output can contain arbitrary Unicode from UI text — a legacy
+    # codepage console must not crash the CLI on it.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(prog="linux-computer-use-mcp")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("serve")
