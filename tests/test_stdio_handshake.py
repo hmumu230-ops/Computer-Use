@@ -49,6 +49,7 @@ EXPECTED_TOOLS = {
     "Clipboard",
     "DisplayInventory",
     "FileSystem",
+    "FindText",
     "Move",
     "MultiEdit",
     "MultiSelect",

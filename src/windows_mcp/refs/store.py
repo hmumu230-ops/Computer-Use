@@ -148,6 +148,19 @@ class RefStore:
             self.latest[flat_index] = locator
         self._evict()
 
+    def register(self, locator: ElementLocator) -> int:
+        """Issue a ref for a locator outside the snapshot flow.
+
+        Used by OCR/word hits: point-in-time elements that are click-addressable
+        via @eN but never re-resolve (synthetic locators carry only a rect).
+        Returns the assigned ref number.
+        """
+        locator.ref = self._next_ref
+        self._next_ref += 1
+        self._locators[locator.ref] = locator
+        self._evict()
+        return locator.ref
+
     def _evict(self) -> None:
         if len(self._locators) <= self.capacity:
             return

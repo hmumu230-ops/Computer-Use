@@ -8,6 +8,7 @@ from windows_mcp.tools import (
     input,
     multi,
     notification,
+    ocr,
     process,
     registry,
     scrape,
@@ -28,6 +29,7 @@ _MODULES = [
     process,
     notification,
     registry,
+    ocr,
 ]
 
 
