@@ -16,6 +16,7 @@ _PURE_PYTHON_TESTS = {
     "test_desktop_config.py",
     "test_desktop_views.py",
     "test_refs.py",
+    "test_system.py",
     "test_tree_views.py",
 }
 

@@ -453,6 +453,52 @@ class Desktop:
                         "bbox": er.bbox})
         return out
 
+    def clipboard(
+        self,
+        what: str = "text",
+        text: str = "",
+        image_png: bytes | None = None,
+        files: list | None = None,
+        get: bool = False,
+    ) -> dict:
+        """Read/write clipboard payloads (text/image/files)."""
+        from macos_mcp import clipboard as clip
+
+        return clip.clipboard(what=what, text=text, image_png=image_png,
+                              files=files, get=get)
+
+    def find_text(
+        self,
+        needle: str,
+        case_sensitive: bool = False,
+        languages: list | None = None,
+    ) -> list[dict]:
+        """OCR the screen (Vision) and register each hit as a synthetic @eN.
+
+        ImageGrab captures physical pixels (2x on Retina) while AX/logical
+        coordinates are points — boxes are divided by the capture scale so
+        the minted refs land in screen space.
+        """
+        from macos_mcp import ocr
+
+        img = self.get_screenshot()
+        if img is None:
+            raise refs.CuError(
+                "screenshot failed", hint="check Screen Recording permission")
+        screen = self.get_screen_size()
+        scale = (img.width / screen.width) if screen.width else 1.0
+        hits = ocr.find_text(img, needle, languages=languages,
+                             case_sensitive=case_sensitive)
+        out = []
+        for h in hits:
+            bb = {k: int(v / scale) for k, v in h.bbox.items()} \
+                if scale != 1.0 else h.bbox
+            er = refs.STORE.add_synthetic(
+                bb, h.text, metadata={"via": "ocr", "conf": h.confidence})
+            out.append({"ref": er.ref, "text": h.text, "bbox": bb,
+                        "confidence": h.confidence})
+        return out
+
     def wait_for(
         self,
         ref: str = "",
@@ -1051,4 +1097,14 @@ class Desktop:
     ) -> dict:
         return await _to_thread_with_autorelease_pool(
             self.wait_for, ref, role, name, timeout
+        )
+
+    async def async_clipboard(self, what, text, image_png, files, get):
+        return await _to_thread_with_autorelease_pool(
+            self.clipboard, what, text, image_png, files, get
+        )
+
+    async def async_find_text(self, needle, case_sensitive, languages):
+        return await _to_thread_with_autorelease_pool(
+            self.find_text, needle, case_sensitive, languages
         )

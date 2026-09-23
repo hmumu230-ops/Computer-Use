@@ -6,7 +6,7 @@ Provides tools to interact with the macOS desktop for automation.
 
 from macos_mcp.desktop.service import Desktop
 from macos_mcp.desktop.views import Size
-from macos_mcp import safety
+from macos_mcp import safety, system as syskit
 from macos_mcp.watchdog import WatchDog
 from macos_mcp.permissions import validate_permissions
 from macos_mcp.infrastructure import (
@@ -37,6 +37,7 @@ from typing import Any, Literal, Optional
 from fastmcp import FastMCP, Context
 from textwrap import dedent
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -506,6 +507,174 @@ async def wait_for_tool(
 ) -> str:
     hit = await desktop.async_wait_for(ref, role, name, timeout)
     return f"resolved {hit['ref']} {hit.get('role', '')} \"{hit.get('name', '')}\""
+
+
+@mcp.tool(
+    name="Clipboard",
+    description="Read or write the macOS clipboard. mode='get' reads: 'text' returns text, 'image' returns base64 PNG (or empty), 'files' returns file paths. mode='set' writes: pass text=..., image=base64 PNG, or files=[paths].",
+    annotations=ToolAnnotations(
+        title="Clipboard",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def clipboard_tool(
+    mode: Literal["get", "set"] = "get",
+    what: Literal["text", "image", "files"] = "text",
+    text: str = "",
+    image: str = "",
+    files: list[str] | None = None,
+    ctx: Context = None,
+) -> str:
+    import base64
+    image_png = base64.b64decode(image) if image else None
+    result = await desktop.async_clipboard(
+        what, text, image_png, files, mode == "get"
+    )
+    if mode == "get" and what == "image":
+        data = result.get("image_png")
+        return base64.b64encode(data).decode() if data else ""
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool(
+    name="FindText",
+    description="OCR the screen with the native Vision framework and return every visible occurrence of `text` as a clickable @eN ref. Use as a fallback when Snapshot's accessibility tree misses something (canvas apps, Electron, images).",
+    annotations=ToolAnnotations(
+        title="FindText",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def find_text_tool(
+    text: str,
+    case_sensitive: bool = False,
+    ctx: Context = None,
+) -> str:
+    hits = await desktop.async_find_text(text, case_sensitive, None)
+    if not hits:
+        return f"No on-screen text matching '{text}'."
+    lines = [
+        f"{h['ref']} \"{h['text']}\" ({h['bbox']['x']},{h['bbox']['y']},"
+        f"{h['bbox']['w']}x{h['bbox']['h']}) conf={h['confidence']:.2f}"
+        for h in hits
+    ]
+    return f"{len(hits)} match(es):\n" + "\n".join(lines)
+
+
+_SYSTEM_DOMAINS = {
+    "probe": (syskit.probe, False),
+    "identity": (syskit.identity, False),
+    "power_status": (syskit.power_status, False),
+    "display": (syskit.display_list, False),
+    "device": (syskit.device_list, False),
+    "network": (syskit.network_status, False),
+    "audio_get": (syskit.audio_get, False),
+    "env_list": (syskit.env_list, False),
+    "log": (syskit.log_query, False),
+    "audio_set": (syskit.audio_set, False),
+    "audio_mute": (syskit.audio_mute, False),
+    "env_set": (syskit.env_set, True),
+    "power": (syskit.power_action, True),
+    "wifi": (syskit.network_wifi, True),
+}
+
+
+@mcp.tool(
+    name="System",
+    description=(
+        "macOS system information and control. Read domains: probe, identity, "
+        "power_status, display, device(kind=hardware|usb|bluetooth|storage), "
+        "network, audio_get, env_list, log(predicate,last,limit). "
+        "Write domains (confirmToken-gated when MACOS_MCP_REQUIRE_CONFIRM is "
+        "set): audio_set(volume), audio_mute(muted), env_set(name,value), "
+        "power(action=sleep|caffeinate), wifi(power=on|off)."
+    ),
+    annotations=ToolAnnotations(
+        title="System",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def system_tool(
+    domain: str,
+    args: dict | None = None,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    entry = _SYSTEM_DOMAINS.get(domain)
+    if entry is None:
+        raise ValueError(
+            f"unknown domain '{domain}'. available: "
+            + ", ".join(sorted(_SYSTEM_DOMAINS)))
+    fn, dangerous = entry
+    safety.gate(f"system:{domain}", args or {}, dangerous, confirmToken)
+    result = await asyncio.to_thread(fn, **(args or {}))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool(
+    name="Process",
+    description="List processes (name filter) or kill by pid. mode='list' returns pid/comm/cpu/mem/args; mode='kill' sends a signal (TERM default) — gated by confirm token when MACOS_MCP_REQUIRE_CONFIRM is set.",
+    annotations=ToolAnnotations(
+        title="Process",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def process_tool(
+    mode: Literal["list", "kill"] = "list",
+    name: str = "",
+    pid: int = 0,
+    signal: str = "TERM",
+    limit: int = 50,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    if mode == "list":
+        rows = await asyncio.to_thread(syskit.process_list, name, limit)
+        return json.dumps(rows, ensure_ascii=False)
+    safety.gate("process:kill", {"pid": pid, "signal": signal},
+                dangerous=True, token=confirmToken)
+    return await asyncio.to_thread(syskit.process_kill, pid, signal)
+
+
+@mcp.tool(
+    name="Service",
+    description="launchd service management. mode='list' lists services (filter substring); mode='control' runs action=kickstart|enable|disable|bootout on a label in the gui domain — gated by confirm token when MACOS_MCP_REQUIRE_CONFIRM is set.",
+    annotations=ToolAnnotations(
+        title="Service",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def service_tool(
+    mode: Literal["list", "control"] = "list",
+    filter: str = "",
+    label: str = "",
+    action: str = "kickstart",
+    domain: str = "gui",
+    limit: int = 50,
+    confirmToken: str = "",
+    ctx: Context = None,
+) -> str:
+    if mode == "list":
+        rows = await asyncio.to_thread(syskit.service_list, filter, limit)
+        return json.dumps(rows, ensure_ascii=False)
+    safety.gate("service:control", {"label": label, "action": action},
+                dangerous=True, token=confirmToken)
+    return await asyncio.to_thread(
+        syskit.service_control, action, label, domain)
 
 
 _SCRAPE_MAX_CHARS = 20_000
@@ -1116,6 +1285,168 @@ def uninstall() -> None:
         click.echo("Plist already removed.")
 
     click.echo("macos-mcp will no longer start at login.")
+
+
+@main.command()
+def doctor() -> None:
+    """Diagnose the local environment: Python, frameworks, TCC grants, tools."""
+    import importlib.util
+
+    ok = True
+
+    def check(label: str, good: bool, hint: str = "") -> None:
+        nonlocal ok
+        ok = ok and good
+        click.echo(f"  {'PASS' if good else 'FAIL'} {label}"
+                   + (f" — {hint}" if hint and not good else ""))
+
+    click.echo("macos-mcp doctor")
+    click.echo(f"  python: {sys.version.split()[0]} ({sys.executable})")
+
+    if sys.platform != "darwin":
+        click.echo("  note: not macOS — framework checks are import-only")
+
+    for mod, pip_pkg in (
+        ("ApplicationServices", "pyobjc-framework-ApplicationServices"),
+        ("Cocoa", "pyobjc-framework-Cocoa"),
+        ("Quartz", "pyobjc-framework-Quartz"),
+        ("Vision", "pyobjc-framework-Vision"),
+        ("objc", "pyobjc-core"),
+        ("fastmcp", "fastmcp"),
+        ("PIL", "pillow"),
+        ("mcp", "mcp"),
+    ):
+        check(f"module {mod}", importlib.util.find_spec(mod) is not None,
+              f"pip install {pip_pkg}")
+
+    for tool in ("pbcopy", "osascript", "launchctl", "pmset",
+                 "system_profiler", "networksetup", "log"):
+        check(f"tool {tool}", shutil.which(tool) is not None,
+              "expected on macOS — PATH problem?" )
+
+    if sys.platform == "darwin":
+        from macos_mcp.permissions import (
+            check_accessibility_permission,
+            check_screen_recording_permission,
+            accessibility_guidance,
+        )
+        check("Accessibility permission", check_accessibility_permission(),
+              accessibility_guidance())
+        check("Screen Recording permission",
+              check_screen_recording_permission(),
+              "System Settings > Privacy & Security > Screen Recording")
+
+    click.echo(f"\n{'OK' if ok else 'ISSUES FOUND'} — "
+               f"see FAIL lines above.")
+
+
+def _tool_registry() -> dict:
+    """Name → Tool map across FastMCP versions (private API fallback chain)."""
+    tool_mgr = getattr(mcp, "_tool_manager", None)
+    tools_dict = getattr(tool_mgr, "_tools", None)
+    if tools_dict is not None:
+        return dict(tools_dict)
+    provider = getattr(mcp, "_local_provider", None)
+    components = getattr(provider, "_components", {})
+    return {
+        (getattr(v, "name", None) or k.split(":", 1)[1].split("@", 1)[0]): v
+        for k, v in components.items()
+        if isinstance(k, str) and k.startswith("tool:")
+    }
+
+
+def _parse_call_args(pairs: list[str]) -> dict:
+    kwargs = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep:
+            raise click.ClickException(f"--arg must be key=value, got {pair!r}")
+        try:
+            kwargs[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            kwargs[key] = raw
+    return kwargs
+
+
+@main.command(name="tools")
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
+def list_tools(json_out: bool) -> None:
+    """List the registered tool names and descriptions."""
+    rows = []
+    for name, tool in sorted(_tool_registry().items()):
+        desc = (getattr(tool, "description", "") or "").split("\n")[0][:120]
+        rows.append({"name": name, "description": desc})
+    if json_out:
+        click.echo(json.dumps(rows, ensure_ascii=False))
+    else:
+        for row in rows:
+            click.echo(f"{row['name']:<22} {row['description']}")
+
+
+@main.command(name="call")
+@click.argument("tool_name")
+@click.option(
+    "--arg",
+    "pairs",
+    multiple=True,
+    help="Tool argument as key=value; value is JSON-decoded when possible "
+    "(e.g. --arg 'loc=[100,200]' --arg 'ref=\"@e5\"').",
+)
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
+@click.option(
+    "--save-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+    help="Directory for image payloads (default: ~/.macos-mcp/cli).",
+)
+def call_tool(tool_name: str, pairs: tuple[str, ...], json_out: bool,
+              save_dir: str | None) -> None:
+    """Invoke a tool directly without an MCP client.
+
+    Examples:
+      macos-mcp call Snapshot
+      macos-mcp call Click --arg 'ref="@e5"'
+      macos-mcp call Type --arg 'loc=[500,300]' --arg 'text="hello"'
+      macos-mcp call Shell --arg 'command="uname -a"'
+    """
+    global desktop, screen_size
+    import time as _time
+
+    kwargs = _parse_call_args(list(pairs))
+    tool = _tool_registry().get(tool_name)
+    if tool is None:
+        names = ", ".join(sorted(_tool_registry()))
+        raise click.ClickException(
+            f"unknown tool {tool_name!r}. Available: {names}")
+
+    if desktop is None:
+        desktop = Desktop()
+        screen_size = desktop.get_screen_size()
+
+    fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
+    result = fn(**kwargs)
+    if asyncio.iscoroutine(result):
+        result = asyncio.run(result)
+
+    items = result if isinstance(result, list) else [result]
+    counter = 0
+    for item in items:
+        data = getattr(item, "data", None)
+        if data is not None:
+            counter += 1
+            out_dir = save_dir or str(CONFIG_DIR / "cli")
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(
+                out_dir, f"image_{int(_time.time())}_{counter}.png")
+            with open(path, "wb") as f:
+                f.write(data)
+            click.echo(f"[image saved: {path}]")
+        elif hasattr(item, "text"):
+            click.echo(item.text)
+        elif json_out:
+            click.echo(json.dumps(item, ensure_ascii=False, default=str))
+        else:
+            click.echo(item)
 
 
 if __name__ == "__main__":
