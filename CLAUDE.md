@@ -4,14 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Windows-MCP is a Python MCP (Model Context Protocol) server that bridges AI LLM agents with the Windows OS, enabling direct desktop automation. It exposes 20 tools via FastMCP:
+Windows-MCP is a Python MCP (Model Context Protocol) server that bridges AI LLM agents with the Windows OS, enabling direct desktop automation. It exposes 33 tools via FastMCP:
 
 | Group | Tools |
 |---|---|
-| Capture | `Screenshot`, `Snapshot`, `Scrape`, `DisplayInventory` |
+| Capture | `Screenshot`, `Snapshot`, `Scrape`, `DisplayInventory`, `FindText` (OCR) |
 | Input | `Click`, `Type`, `Scroll`, `Move` (also drag-and-drop via `drag=True`), `Shortcut`, `MultiSelect`, `MultiEdit` |
 | Timing | `Wait`, `WaitFor` |
 | System | `App`, `PowerShell`, `FileSystem`, `Registry`, `Process`, `Clipboard`, `Notification` |
+| Admin (added) | `Identity`, `System`, `Window`, `EventLog`, `Audio`, `Display`, `Device`, `Network`, `Service`, `Task`, `Env`, `DevMode` |
+
+Enhanced-fork additions on branch `enhanced`: persistent `@eN` element refs in
+Snapshot (resolved at action time via live-control → index-path → AutomationId →
+RuntimeId), pattern-first input (UIA Invoke/Value/Toggle before synthetic input),
+`raw=True` scan-code input on Shortcut/Type, OCR layer (RapidOCR) with
+`FindText`, clipboard image/file payloads, a confirm-token safety gate
+(`WINDOWS_MCP_REQUIRE_CONFIRM`), and direct CLI (`windows-mcp tools` /
+`windows-mcp call <Tool> --arg k=v`).
 
 Tool names are defined by the `name=` argument of each `@mcp.tool(...)` in `src/windows_mcp/tools/`; that directory is the source of truth. Note the shell tool is registered as `PowerShell`, not `Shell`. Any subset can be removed at startup with `--disable-tools` (e.g. `--disable-tools PowerShell,Registry`).
 
