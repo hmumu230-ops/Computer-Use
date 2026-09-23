@@ -32,6 +32,7 @@ import subprocess
 import click
 import os
 import sys
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def _echo_section(title: str) -> None:
     try:
         "─".encode(enc)
         bar = "─" * 3
-    except (UnicodeEncodeError, LookupError):
+    except UnicodeEncodeError, LookupError:
         bar = "==="
     click.echo(f"\n{bar} {title} {bar}")
 
@@ -1026,6 +1027,135 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
   }}
 }}"""
         )
+
+
+def _tool_registry(mcp) -> dict:
+    """Name → Tool map, using the same fallback chain as _apply_tool_filter."""
+    tool_mgr = getattr(mcp, "_tool_manager", None)
+    tools_dict = getattr(tool_mgr, "_tools", None)
+    if tools_dict is not None:
+        return dict(tools_dict)
+    provider = getattr(mcp, "_local_provider", None)
+    components = getattr(provider, "_components", {})
+    return {
+        (getattr(v, "name", None) or k.split(":", 1)[1].split("@", 1)[0]): v
+        for k, v in components.items()
+        if isinstance(k, str) and k.startswith("tool:")
+    }
+
+
+def _parse_call_args(pairs: list[str]) -> dict:
+    """Parse --arg key=value pairs; values are decoded as JSON when possible."""
+    import json as _json
+
+    kwargs = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep:
+            raise click.ClickException(f"--arg must be key=value, got {pair!r}")
+        try:
+            kwargs[key] = _json.loads(raw)
+        except _json.JSONDecodeError:
+            kwargs[key] = raw
+    return kwargs
+
+
+def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
+    """Print a tool result; Image payloads are written to PNG files."""
+    import json as _json
+
+    items = result if isinstance(result, list) else [result]
+    out = []
+    counter = 0
+    for item in items:
+        if getattr(item, "data", None) is not None and getattr(item, "mimeType", ""):
+            counter += 1
+            if save_dir is None:
+                save_dir = os.path.join(os.environ.get("LOCALAPPDATA", "."), "windows-mcp", "cli")
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f"image_{int(time.time())}_{counter}.png")
+            with open(path, "wb") as f:
+                f.write(item.data)
+            out.append({"image": path})
+        elif hasattr(item, "text"):
+            out.append(item.text)
+        else:
+            out.append(item)
+    if json_out:
+        click.echo(_json.dumps(out, ensure_ascii=False, default=str))
+    else:
+        for entry in out:
+            if isinstance(entry, dict) and "image" in entry:
+                click.echo(f"[image saved: {entry['image']}]")
+            else:
+                click.echo(entry)
+
+
+@main.command(name="tools")
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
+def list_tools(json_out: bool) -> None:
+    """List the registered tool names and descriptions."""
+    import json as _json
+
+    mcp = _build_mcp()
+    registry = _tool_registry(mcp)
+    rows = []
+    for name in sorted(registry):
+        tool = registry[name]
+        desc = getattr(tool, "description", "") or ""
+        rows.append({"name": name, "description": desc.split("\n")[0][:120]})
+    if json_out:
+        click.echo(_json.dumps(rows, ensure_ascii=False))
+    else:
+        for row in rows:
+            click.echo(f"{row['name']:<22} {row['description']}")
+
+
+@main.command(name="call")
+@click.argument("tool_name")
+@click.option(
+    "--arg",
+    "pairs",
+    multiple=True,
+    help="Tool argument as key=value; value is JSON-decoded when possible "
+    "(e.g. --arg 'loc=[100,200]' --arg 'clear=true').",
+)
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON.")
+@click.option(
+    "--save-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+    help="Directory for image payloads (default: %%LOCALAPPDATA%%\\windows-mcp\\cli).",
+)
+def call_tool(tool_name: str, pairs: tuple[str, ...], json_out: bool, save_dir: str | None):
+    """Invoke a tool directly without an MCP client.
+
+    Examples:
+      windows-mcp call Snapshot
+      windows-mcp call Click --arg 'ref="@e5"'
+      windows-mcp call Type --arg 'loc=[500,300]' --arg 'text="hello"'
+      windows-mcp call PowerShell --arg 'command="Get-Date"'
+    """
+    global desktop
+
+    kwargs = _parse_call_args(list(pairs))
+    mcp = _build_mcp()
+    registry = _tool_registry(mcp)
+    tool = registry.get(tool_name)
+    if tool is None:
+        names = ", ".join(sorted(registry))
+        raise click.ClickException(f"unknown tool {tool_name!r}. Available: {names}")
+
+    if desktop is None:
+        from windows_mcp.desktop.service import Desktop
+
+        desktop = Desktop()
+
+    fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
+    result = fn(**kwargs)
+    if asyncio.iscoroutine(result):
+        result = asyncio.run(result)
+    _emit_result(result, json_out, save_dir)
 
 
 if __name__ == "__main__":
