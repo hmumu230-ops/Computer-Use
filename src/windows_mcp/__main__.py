@@ -53,7 +53,7 @@ def _echo_section(title: str) -> None:
     try:
         "─".encode(enc)
         bar = "─" * 3
-    except UnicodeEncodeError, LookupError:
+    except (UnicodeEncodeError, LookupError):
         bar = "==="
     click.echo(f"\n{bar} {title} {bar}")
 
