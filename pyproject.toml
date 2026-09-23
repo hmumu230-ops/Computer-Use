@@ -46,7 +46,10 @@ dev = [
     "pytest-asyncio>=0.24.0",
 ]
 ocr = [
-    "rapidocr-onnxruntime>=1.4,<2",
+    "rapidocr>=3.0,<4",
+    # 3.x made inference engines pluggable; onnxruntime is the default engine
+    # but no longer a transitive dep — pin it explicitly.
+    "onnxruntime>=1.19",
 ]
 
 [project.urls]

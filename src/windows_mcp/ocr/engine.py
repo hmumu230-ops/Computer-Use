@@ -1,9 +1,10 @@
 """OCR engine wrapper — RapidOCR (ONNX Runtime) with clean degradation.
 
-The engine is optional: when ``rapidocr-onnxruntime`` is not installed every
-entry point raises ``OcrError(code="ENGINE_UNAVAILABLE")`` with an install
-hint instead of ImportError noise. OCR'd words carry *screen* coordinates —
-``offset`` re-bases region captures into desktop pixel space.
+The engine is optional: when ``rapidocr`` (3.x, preferred) or the legacy
+``rapidocr-onnxruntime`` package is not installed every entry point raises
+``OcrError(code="ENGINE_UNAVAILABLE")`` with an install hint instead of
+ImportError noise. OCR'd words carry *screen* coordinates — ``offset``
+re-bases region captures into desktop pixel space.
 """
 
 from __future__ import annotations
@@ -78,18 +79,21 @@ def _engine() -> Any:
         raise OcrError(
             "ENGINE_UNAVAILABLE",
             "OCR engine failed to initialize earlier",
-            hint="install rapidocr-onnxruntime or check the server log",
+            hint="install rapidocr or check the server log",
         )
     _ENGINE_TRIED = True
     try:
-        from rapidocr_onnxruntime import RapidOCR
+        from rapidocr import RapidOCR  # 3.x (current)
     except ImportError:
-        raise OcrError(
-            "ENGINE_UNAVAILABLE",
-            "OCR engine is not installed",
-            hint="pip install rapidocr-onnxruntime "
-            '(or run with "uvx --from windows-mcp windows-mcp --with rapidocr-onnxruntime")',
-        )
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # legacy 1.x
+        except ImportError:
+            raise OcrError(
+                "ENGINE_UNAVAILABLE",
+                "OCR engine is not installed",
+                hint="pip install 'rapidocr>=3.0' "
+                '(or run with "uvx --from windows-mcp windows-mcp --with rapidocr")',
+            )
     try:
         _ENGINE = RapidOCR()
     except Exception as e:
@@ -115,13 +119,22 @@ def ocr_image(image: Any, offset: tuple[int, int] = (0, 0)) -> list[OcrWord]:
     except Exception as e:
         raise OcrError("ENGINE_UNAVAILABLE", f"failed to convert image for OCR: {e}")
     try:
-        result, _elapse = engine(arr)
+        out = engine(arr)
     except Exception as e:
         raise OcrError("ENGINE_UNAVAILABLE", f"OCR inference failed: {e}")
 
+    # rapidocr 3.x returns RapidOCROutput (.boxes/.txts/.scores);
+    # legacy rapidocr-onnxruntime returns (result, elapse).
+    if hasattr(out, "txts"):
+        boxes = list(out.boxes) if out.boxes is not None else []
+        items = zip(boxes, out.txts or [], out.scores or [])
+    else:
+        result, _elapse = out
+        items = result or []
+
     ox, oy = offset
     words: list[OcrWord] = []
-    for box, text, score in result or []:
+    for box, text, score in items:
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
         words.append(
@@ -156,9 +169,5 @@ def find(
         t = " ".join(t.split())
         return t if case_sensitive else t.casefold()
 
-    matches = [
-        w
-        for w in words
-        if (norm(w.text) == query if exact else query in norm(w.text))
-    ]
+    matches = [w for w in words if (norm(w.text) == query if exact else query in norm(w.text))]
     return sorted(matches, key=lambda w: w.score, reverse=True)
