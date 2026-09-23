@@ -1523,6 +1523,34 @@ def _VKtoSC(key: int) -> int:
     return scanCode
 
 
+def VKtoSC(key: int) -> int:
+    """
+    Map a virtual-key code to a scan code.
+    key: int, a value in class `Keys`.
+    Return int; values > 0xFF carry the E0 extended-key prefix.
+    """
+    return _VKtoSC(key)
+
+
+def SendScanCode(key: int, keyUp: bool = False) -> int:
+    """
+    Send a single key press/release as a raw scan code via SendInput
+    (KEYEVENTF_SCANCODE). Reaches apps that ignore virtual-key input
+    (some games, remote-desktop windows, low-level hooks).
+    key: int, a virtual-key code in class `Keys`.
+    keyUp: bool, True sends the release instead of the press.
+    Return int, events inserted into the input stream.
+    """
+    scanCode = VKtoSC(key)
+    flags = KeyboardEventFlag.KeyScanCode
+    if scanCode > 0xFF:
+        flags |= KeyboardEventFlag.ExtendedKey
+        scanCode &= 0xFF
+    if keyUp:
+        flags |= KeyboardEventFlag.KeyUp
+    return SendInput(KeyboardInput(0, scanCode, flags))
+
+
 def SendKeys(
     text: str,
     interval: float = 0.01,

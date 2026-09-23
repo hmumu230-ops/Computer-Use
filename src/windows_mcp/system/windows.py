@@ -159,19 +159,32 @@ def bring_to_front(window: str | int | None = None, hwnd: int | None = None) -> 
     # first so Windows treats us as part of the active input flow.
     fg = win32gui.GetForegroundWindow()
     if fg != target:
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        fg_tid = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+        tg_tid = win32process.GetWindowThreadProcessId(target)[0]
+        attached = []
         try:
-            cur = win32process.GetCurrentThreadId()
-            fg_tid = win32process.GetWindowThreadProcessId(fg)[0]
-            tg_tid = win32process.GetWindowThreadProcessId(target)[0]
-            user32.AttachThreadInput(cur, fg_tid, True)
-            user32.AttachThreadInput(cur, tg_tid, True)
+            user32.AllowSetForegroundWindow(-1)
+            for tid in (fg_tid, tg_tid):
+                if tid and tid != cur:
+                    try:
+                        user32.AttachThreadInput(cur, tid, True)
+                        attached.append(tid)
+                    except Exception:
+                        pass
             win32gui.ShowWindow(target, win32con.SW_RESTORE)
             win32gui.SetForegroundWindow(target)
             win32gui.BringWindowToTop(target)
-            user32.AttachThreadInput(cur, fg_tid, False)
-            user32.AttachThreadInput(cur, tg_tid, False)
         except Exception:
-            win32gui.SetForegroundWindow(target)
+            # Foreground lock refused (caller lacks input rights, target is
+            # elevated, etc.) — report actual state rather than raising.
+            pass
+        finally:
+            for tid in attached:
+                try:
+                    user32.AttachThreadInput(cur, tid, False)
+                except Exception:
+                    pass
     return window_info(hwnd=target)
 
 

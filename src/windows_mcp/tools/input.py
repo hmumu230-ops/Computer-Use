@@ -311,10 +311,7 @@ def register(
             result = actions.activate(locator)
             if result is not None:
                 observed = actions.format_observed(result["changes"], result["after"])
-                return (
-                    f"Single left clicked {via} at ({x},{y}) "
-                    f"via {result['method']}.{observed}"
-                )
+                return f"Single left clicked {via} at ({x},{y}) via {result['method']}.{observed}"
             if _pattern_required(method):
                 raise ValueError(
                     f"method='invoke' but no UIA pattern applies to {via} "
@@ -352,6 +349,7 @@ def register(
         caret_position: Literal["start", "idle", "end"] = "idle",
         press_enter: bool | str = False,
         method: Literal["auto", "invoke", "synthetic"] = "auto",
+        raw: bool = False,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
@@ -362,10 +360,12 @@ def register(
         enter_bool = _as_bool(press_enter, "press_enter")
 
         # ValuePattern is full-content replace — only correct for clear-and-set,
-        # and can't satisfy caret positioning or a trailing Enter.
+        # and can't satisfy caret positioning or a trailing Enter. raw=True asks
+        # for real keystrokes, so it must stay on the synthetic path too.
         setvalue_ok = (
             locator is not None
             and method != "synthetic"
+            and not raw
             and clear_bool
             and not enter_bool
             and caret_position == "idle"
@@ -393,8 +393,11 @@ def register(
             caret_position=caret_position,
             clear=clear,
             press_enter=press_enter,
+            raw=raw,
         )
         suffix = " (synthetic)" if locator is not None and method == "auto" else ""
+        if raw:
+            suffix += " (scan code)"
         return f"Typed {text} at ({x},{y}) on {via}{suffix}."
 
     @mcp.tool(
@@ -510,7 +513,7 @@ def register(
 
     @mcp.tool(
         name="Shortcut",
-        description='Executes keyboard shortcuts using key combinations separated by +. Examples: "ctrl+c" (copy), "ctrl+v" (paste), "alt+tab" (switch apps), "win+r" (Run dialog), "win" (Start menu), "ctrl+shift+esc" (Task Manager). Use for quick actions and system commands.',
+        description='Executes keyboard shortcuts using key combinations separated by +. Examples: "ctrl+c" (copy), "ctrl+v" (paste), "alt+tab" (switch apps), "win+r" (Run dialog), "win" (Start menu), "ctrl+shift+esc" (Task Manager). Set raw=True to send scan codes (KEYEVENTF_SCANCODE) instead of virtual keys — needed by apps that ignore VK input (some games, remote-desktop windows, low-level hooks). Use for quick actions and system commands.',
         annotations=ToolAnnotations(
             title="Shortcut",
             readOnlyHint=False,
@@ -520,9 +523,9 @@ def register(
         ),
     )
     @with_analytics(get_analytics(), "Shortcut-Tool")
-    def shortcut_tool(shortcut: str, ctx: Context = None):
-        get_desktop().shortcut(shortcut)
-        return f"Pressed {shortcut}."
+    def shortcut_tool(shortcut: str, raw: bool = False, ctx: Context = None):
+        get_desktop().shortcut(shortcut, raw=raw)
+        return f"Pressed {shortcut}{' (scan code)' if raw else ''}."
 
     @mcp.tool(
         name="Wait",

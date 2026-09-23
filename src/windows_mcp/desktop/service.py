@@ -31,6 +31,7 @@ import requests
 import logging
 import random
 import ctypes
+from ctypes import wintypes
 import csv
 import re
 import os
@@ -705,9 +706,7 @@ class Desktop:
         for node in tree_state.interactive_nodes + tree_state.scrollable_nodes:
             locator = getattr(node, "locator", None)
             if locator is None:
-                locator = ElementLocator.synthetic_locator(
-                    bounding_box=node.bounding_box
-                )
+                locator = ElementLocator.synthetic_locator(bounding_box=node.bounding_box)
                 node.locator = locator
             locators.append(locator)
         self.ref_store.rebuild(locators)
@@ -781,29 +780,47 @@ class Desktop:
         caret_position: Literal["start", "idle", "end"] = "idle",
         clear: bool | str = False,
         press_enter: bool | str = False,
+        raw: bool | str = False,
     ):
         x, y = loc
+        is_raw = raw is True or (isinstance(raw, str) and raw.lower() == "true")
         uia.Click(x, y)
         if caret_position == "start":
-            uia.SendKeys("{Home}", waitTime=0.05)
+            if is_raw:
+                uia.SendScanCode(uia.Keys.VK_HOME)
+            else:
+                uia.SendKeys("{Home}", waitTime=0.05)
         elif caret_position == "end":
-            uia.SendKeys("{End}", waitTime=0.05)
+            if is_raw:
+                uia.SendScanCode(uia.Keys.VK_END)
+            else:
+                uia.SendKeys("{End}", waitTime=0.05)
         if clear is True or (isinstance(clear, str) and clear.lower() == "true"):
             sleep(0.5)
-            uia.SendKeys("{Ctrl}a", waitTime=0.05)
-            uia.SendKeys("{Back}", waitTime=0.05)
-        # Per-key SendKeys for short text (so escape sequences keep working);
-        # clipboard paste for long text (so the scan-code queue can't race).
-        has_control_chars = any(c in text for c in ("\n", "\t", "{", "}"))
-        if len(text) >= self._LONG_TEXT_PASTE_THRESHOLD and not has_control_chars:
-            self._paste_text(text)
+            if is_raw:
+                self._shortcut_scancode("ctrl+a")
+                self._shortcut_scancode("backspace")
+            else:
+                uia.SendKeys("{Ctrl}a", waitTime=0.05)
+                uia.SendKeys("{Back}", waitTime=0.05)
+        if is_raw:
+            self._type_scancode(text)
         else:
-            escaped_text = _escape_text_for_sendkeys(text)
-            # Bump interval from 0.02 → 0.04. Keeps short-text speed acceptable
-            # while reducing key-loss on slower systems.
-            uia.SendKeys(escaped_text, interval=0.04, waitTime=0.05)
+            # Per-key SendKeys for short text (so escape sequences keep working);
+            # clipboard paste for long text (so the scan-code queue can't race).
+            has_control_chars = any(c in text for c in ("\n", "\t", "{", "}"))
+            if len(text) >= self._LONG_TEXT_PASTE_THRESHOLD and not has_control_chars:
+                self._paste_text(text)
+            else:
+                escaped_text = _escape_text_for_sendkeys(text)
+                # Bump interval from 0.02 → 0.04. Keeps short-text speed acceptable
+                # while reducing key-loss on slower systems.
+                uia.SendKeys(escaped_text, interval=0.04, waitTime=0.05)
         if press_enter is True or (isinstance(press_enter, str) and press_enter.lower() == "true"):
-            uia.SendKeys("{Enter}", waitTime=0.05)
+            if is_raw:
+                uia.SendScanCode(uia.Keys.VK_RETURN)
+            else:
+                uia.SendKeys("{Enter}", waitTime=0.05)
 
     def _paste_text(self, text: str):
         """Stash text on the clipboard, Ctrl+V, restore prior clipboard.
@@ -914,7 +931,9 @@ class Desktop:
         x, y = loc
         uia.MoveTo(x, y, moveSpeed=10)
 
-    def shortcut(self, shortcut: str):
+    def shortcut(self, shortcut: str, raw: bool | str = False):
+        if raw is True or (isinstance(raw, str) and raw.lower() == "true"):
+            return self._shortcut_scancode(shortcut)
         keys = shortcut.split("+")
         sendkeys_str = ""
         for key in keys:
@@ -925,6 +944,81 @@ class Desktop:
                 name = _KEY_ALIASES.get(key.lower(), key)
                 sendkeys_str += "{" + name + "}"
         uia.SendKeys(sendkeys_str, interval=0.01)
+
+    @staticmethod
+    def _vk_for_key_name(name: str) -> tuple[int, list[int]]:
+        """Resolve a shortcut key name to (vk, extra modifier vks)."""
+        if len(name) == 1:
+            res = ctypes.windll.user32.VkKeyScanW(wintypes.WCHAR(name))
+            if res == -1:
+                raise ValueError(f"no virtual key mapping for {name!r}")
+            mods = (res >> 8) & 0xFF
+            extra = []
+            if mods & 1:
+                extra.append(uia.Keys.VK_SHIFT)
+            if mods & 2:
+                extra.append(uia.Keys.VK_CONTROL)
+            if mods & 4:
+                extra.append(uia.Keys.VK_MENU)
+            return res & 0xFF, extra
+        aliased = _KEY_ALIASES.get(name.lower(), name)
+        vk = uia.SpecialKeyNames.get(aliased.upper())
+        if vk is None:
+            raise ValueError(f"unknown key name {name!r}")
+        return vk, []
+
+    def _shortcut_scancode(self, shortcut: str):
+        """Send a shortcut as raw scan codes (KEYEVENTF_SCANCODE) for apps
+        that ignore virtual-key input (some games, RDP windows, hooks)."""
+        vks = []
+        for part in shortcut.split("+"):
+            part = part.strip()
+            if not part:
+                continue
+            vk, extra = self._vk_for_key_name(part)
+            vks.extend(extra)
+            vks.append(vk)
+        if not vks:
+            raise ValueError(f"empty shortcut {shortcut!r}")
+        for vk in vks:
+            uia.SendScanCode(vk, keyUp=False)
+            sleep(0.01)
+        for vk in reversed(vks):
+            uia.SendScanCode(vk, keyUp=True)
+            sleep(0.01)
+
+    def _type_scancode(self, text: str):
+        """Type text as raw scan codes; unmapped chars fall back to
+        KEYEVENTF_UNICODE injection."""
+        for ch in text:
+            if ch == "\r":
+                continue
+            if ch == "\n":
+                uia.SendScanCode(uia.Keys.VK_RETURN)
+                continue
+            if ch == "\t":
+                uia.SendScanCode(uia.Keys.VK_TAB)
+                continue
+            res = ctypes.windll.user32.VkKeyScanW(wintypes.WCHAR(ch))
+            if res == -1:
+                uia.SendUnicodeChar(ch)
+                continue
+            vk = res & 0xFF
+            mods = (res >> 8) & 0xFF
+            mod_vks = []
+            if mods & 1:
+                mod_vks.append(uia.Keys.VK_SHIFT)
+            if mods & 2:
+                mod_vks.append(uia.Keys.VK_CONTROL)
+            if mods & 4:
+                mod_vks.append(uia.Keys.VK_MENU)
+            for m in mod_vks:
+                uia.SendScanCode(m, keyUp=False)
+            uia.SendScanCode(vk, keyUp=False)
+            uia.SendScanCode(vk, keyUp=True)
+            for m in reversed(mod_vks):
+                uia.SendScanCode(m, keyUp=True)
+            sleep(0.01)
 
     def multi_select(self, press_ctrl: bool | str = False, locs: list[tuple[int, int]] = []):
         press_ctrl = press_ctrl is True or (
