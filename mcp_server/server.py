@@ -62,7 +62,16 @@ def _drain_stderr(p: subprocess.Popen) -> None:
         pass
 
 
-def bridge_call(cmd: str, args: dict[str, Any] | None = None) -> Any:
+def _readline(pipe, timeout: float) -> str:
+    """readline with a deadline — a hung bridge must not freeze the server."""
+    import select
+    if not select.select([pipe], [], [], timeout)[0]:
+        raise TimeoutError(f"bridge did not respond within {timeout:.0f}s")
+    return pipe.readline()
+
+
+def bridge_call(cmd: str, args: dict[str, Any] | None = None,
+                timeout: float = 90.0) -> Any:
     """One NDJSON roundtrip. Re-spawns a dead bridge once."""
     global _proc
     with _lock:
@@ -75,7 +84,20 @@ def bridge_call(cmd: str, args: dict[str, Any] | None = None) -> Any:
                 assert _proc.stdin and _proc.stdout
                 _proc.stdin.write(json.dumps(req) + "\n")
                 _proc.stdin.flush()
-                line = _proc.stdout.readline()
+                line = _readline(_proc.stdout, timeout)
+            except TimeoutError as e:
+                # A wedged bridge can't be trusted — kill and respawn once.
+                try:
+                    _proc.kill()
+                except Exception:
+                    pass
+                _proc = None
+                if attempt == 0:
+                    continue
+                raise RuntimeError(
+                    json.dumps({"code": "BRIDGE_TIMEOUT", "message": str(e),
+                                "hint": "bridge hung; it was restarted",
+                                "retryable": True}))
             except (BrokenPipeError, OSError, AssertionError) as e:
                 if attempt == 0:
                     _proc = None

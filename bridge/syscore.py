@@ -84,7 +84,7 @@ def _svc_action(verb: str, name: str, scope: str, confirm_token: str = "",
                 dangerous, confirm_token)
     base = ["systemctl"] + (["--user"] if scope == "user" else [])
     cmd = base + [verb, name] + (extra or [])
-    if os.geteuid() != 0 and scope == "system" and which("sudo"):
+    if getattr(os, "geteuid", lambda: 1)() != 0 and scope == "system" and which("sudo"):
         # polkit will prompt on desktop; sudo -n for NOPASSWD; else let
         # systemctl's own polkit path try (it returns a clean error)
         pass
@@ -177,7 +177,8 @@ def task_add_timer(command: str, on_calendar: str = "",
         cmd += ["--on-active", on_active]
     if not (on_calendar or on_active):
         raise CuError("timer needs on_calendar or on_active")
-    cmd += ["--"] + command.split() if " " in command else cmd + [command]
+    import shlex
+    cmd += ["--"] + shlex.split(command)
     r = run(cmd, timeout=15)
     if r.returncode != 0:
         raise CuError(f"systemd-run failed: {r.stderr.strip()}")

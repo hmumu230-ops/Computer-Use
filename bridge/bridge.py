@@ -599,6 +599,11 @@ def cmd_launch_app(req):
     import subprocess
     a = _args(req, "target")
     target = a["target"]
+    # Launching an app can run arbitrary /bin/sh -c text — same risk class
+    # as service control, so it goes through the same confirm-token gate.
+    import safety
+    safety.gate("app:launch", {"target": target}, True,
+                req.get("confirmToken", ""))
     # .desktop file id → gtk-launch; path → gio launch; else xdg-open/exec
     if target.endswith(".desktop") or "/" not in target:
         if util.which("gtk-launch") and not target.endswith(".desktop"):
@@ -839,6 +844,14 @@ def main() -> int:
             sys.stdout.write(json.dumps(
                 {"id": None, "ok": False,
                  "error": InvalidArgs(f"bad json: {e}").to_dict()}) + "\n")
+            sys.stdout.flush()
+            continue
+        if not isinstance(req, dict):
+            sys.stdout.write(json.dumps(
+                {"id": None, "ok": False,
+                 "error": InvalidArgs(
+                     f"request must be a JSON object, got {type(req).__name__}"
+                 ).to_dict()}) + "\n")
             sys.stdout.flush()
             continue
         rid = req.get("id")
