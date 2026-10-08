@@ -35,6 +35,7 @@ def register(mcp, *, get_desktop, get_analytics):
         path: str | None = None,
         paths: list[str] | None = None,
         save_path: str | None = None,
+        cut: bool | str = False,
         ctx: Context = None,
     ):
         if mode == "get":
@@ -47,9 +48,12 @@ def register(mcp, *, get_desktop, get_analytics):
                 return f"{header}\nClipboard contains {len(content.files)} file(s):\n{listing}"
             if content.kind == "image":
                 if save_path:
-                    with open(save_path, "wb") as f:
-                        f.write(content.image_png)
-                    note = f"\nSaved to {save_path}."
+                    from pathlib import Path as _Path
+
+                    _p = _Path(save_path).expanduser()
+                    _p.parent.mkdir(parents=True, exist_ok=True)
+                    _p.write_bytes(content.image_png)
+                    note = f"\nSaved to {_p.resolve()}."
                 else:
                     note = ""
                 text_part = f"{header}\nClipboard contains an image.{note}"
@@ -74,9 +78,11 @@ def register(mcp, *, get_desktop, get_analytics):
         if mode == "set_files":
             if not paths:
                 return "Error: paths parameter required for set_files mode."
-            result = clip.set_files(paths)
+            cut_bool = cut is True or (isinstance(cut, str) and cut.lower() == "true")
+            result = clip.set_files(paths, cut=cut_bool)
+            effect = "cut" if result.get("effect") == "cut" else "copied"
             return (
-                f"Clipboard set to {len(result['files'])} file(s). "
+                f"Clipboard set to {len(result['files'])} file(s) ({effect}). "
                 "Paste with Ctrl+V in Explorer or a file dialog."
             )
         return 'Error: mode must be "get", "set", "set_image", or "set_files".'
