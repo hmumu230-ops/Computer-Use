@@ -20,6 +20,11 @@ _FEATURE_ALIASES = {
 }
 
 
+def _q(s: str) -> str:
+    """Escape a value for a PowerShell single-quoted string literal."""
+    return s.replace("'", "''")
+
+
 def get_developer_mode() -> dict[str, Any]:
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _APP_MODEL_UNLOCK) as key:
@@ -63,7 +68,7 @@ def list_optional_features() -> tuple[Any, int]:
 
 
 def get_feature(name: str) -> tuple[Any, int]:
-    real = _FEATURE_ALIASES.get(name.lower(), name)
+    real = _q(_FEATURE_ALIASES.get(name.lower(), name))
     return PowerShellExecutor.execute_command(
         f"Get-WindowsOptionalFeature -Online -FeatureName '{real}' | "
         "Select-Object FeatureName,State | ConvertTo-Json -Compress"
@@ -71,7 +76,7 @@ def get_feature(name: str) -> tuple[Any, int]:
 
 
 def set_feature(name: str, enabled: bool) -> tuple[Any, int]:
-    real = _FEATURE_ALIASES.get(name.lower(), name)
+    real = _q(_FEATURE_ALIASES.get(name.lower(), name))
     verb = "Enable" if enabled else "Disable"
     return PowerShellExecutor.execute_command(
         f"{verb}-WindowsOptionalFeature -Online -FeatureName '{real}' -NoRestart "

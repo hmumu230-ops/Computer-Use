@@ -21,6 +21,11 @@ def _ps(cmd: str, timeout: int = 30) -> tuple[Any, int]:
         return out.strip(), rc
 
 
+def _q(s: str) -> str:
+    """Escape a value for a PowerShell single-quoted string literal."""
+    return s.replace("'", "''")
+
+
 def list_adapters() -> tuple[Any, int]:
     return _ps(
         "Get-NetAdapter | Select-Object Name,Status,InterfaceDescription,"
@@ -96,14 +101,15 @@ def set_proxy(
 
 
 def test_connection(host: str, port: int | None = None) -> tuple[Any, int]:
+    safe = _q(host)
     if port:
         return _ps(
-            f"Test-NetConnection -ComputerName '{host}' -Port {port} "
+            f"Test-NetConnection -ComputerName '{safe}' -Port {int(port)} "
             "-InformationLevel Detailed | ConvertTo-Json -Compress",
             timeout=60,
         )
     return _ps(
-        f"Test-Connection -ComputerName '{host}' -Count 2 -ErrorAction SilentlyContinue "
+        f"Test-Connection -ComputerName '{safe}' -Count 2 -ErrorAction SilentlyContinue "
         "| Select-Object Address,StatusCode,ResponseTime | ConvertTo-Json -Compress",
         timeout=30,
     )

@@ -146,6 +146,12 @@ class RefStore:
     def __init__(self, capacity: int = 5000):
         self._next_ref = 1
         self._locators: dict[int, ElementLocator] = {}
+        # Element identity → ref. Lets repeated Snapshots reuse the same ref
+        # for the same live element instead of minting a new one every pass.
+        # Without this, WaitFor polls (a rebuild per interval) burn through
+        # `capacity` and evict refs whose elements are still on screen.
+        self._identity: dict[tuple[int, tuple[int, ...], str, str], int] = {}
+        self._ref_key: dict[int, tuple[int, tuple[int, ...], str, str]] = {}
         self.latest: dict[int, ElementLocator] = {}
         self.capacity = capacity
         self.generation = 0
@@ -154,23 +160,51 @@ class RefStore:
         # duplicate ref numbers and tear `latest` mid-publish.
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _identity_key(
+        locator: ElementLocator,
+    ) -> tuple[int, tuple[int, ...], str, str] | None:
+        """Stable element identity for cross-snapshot ref reuse.
+
+        name/control_type are part of the key: a RuntimeId recycled by a
+        different element must mint a fresh ref, not inherit the old one's
+        (Save-dies-Delete-inherits → @eN must go stale, not retarget).
+        """
+        if locator.synthetic or not locator.runtime_id:
+            return None
+        return (
+            locator.window_handle or locator.process_id,
+            locator.runtime_id,
+            locator.name,
+            locator.control_type,
+        )
+
     # -- issuance ---------------------------------------------------------
 
     def rebuild(self, locators: list[ElementLocator]) -> None:
         """Assign refs to a fresh snapshot's locators and refresh `latest`.
 
         `locators` must already be in flat label order (interactive first,
-        then scrollable). Old locators stay registered — their elements may
-        still be alive.
+        then scrollable). Elements seen before keep their existing ref — a
+        `@eN` handle stays valid across Snapshots and churny polls don't
+        evict live elements.
         """
         latest: dict[int, ElementLocator] = {}
         with self._lock:
             self.generation += 1
             for flat_index, locator in enumerate(locators):
                 if locator.ref == 0:
-                    locator.ref = self._next_ref
-                    self._next_ref += 1
+                    key = self._identity_key(locator)
+                    existing = self._identity.get(key) if key else None
+                    if existing is not None and existing in self._locators:
+                        locator.ref = existing
+                    else:
+                        locator.ref = self._next_ref
+                        self._next_ref += 1
                     self._locators[locator.ref] = locator
+                    if key is not None:
+                        self._identity[key] = locator.ref
+                        self._ref_key[locator.ref] = key
                 latest[flat_index] = locator
             self.latest = latest  # atomic publish — no half-filled table
             self._evict()
@@ -196,6 +230,9 @@ class RefStore:
         overflow = len(self._locators) - self.capacity
         for ref in sorted(self._locators)[:overflow]:
             del self._locators[ref]
+            key = self._ref_key.pop(ref, None)
+            if key is not None:
+                self._identity.pop(key, None)
 
     # -- parsing ----------------------------------------------------------
 
@@ -325,7 +362,9 @@ class RefStore:
                     return candidate
             # 3) bounded runtime-id scan
             if locator.runtime_id:
-                candidate = self._scan_runtime_id(window, locator.runtime_id)
+                candidate = self._scan_runtime_id(
+                    window, locator.runtime_id, locator.name
+                )
                 if candidate is not None:
                     return candidate
         # Window gone or element truly absent.
@@ -374,7 +413,9 @@ class RefStore:
                 return None
         return candidate
 
-    def _scan_runtime_id(self, window: Any, runtime_id: tuple[int, ...]) -> Any | None:
+    def _scan_runtime_id(
+        self, window: Any, runtime_id: tuple[int, ...], name: str = ""
+    ) -> Any | None:
         try:
             elements = window.FindAll(
                 uia.TreeScope.TreeScope_Descendants, uia.CreateTrueCondition()
@@ -382,8 +423,18 @@ class RefStore:
         except Exception:
             return None
         for candidate in elements[:_SCAN_LIMIT]:
-            if _runtime_id_of(candidate) == runtime_id:
-                if _probe_alive(candidate):
-                    return candidate
+            if _runtime_id_of(candidate) != runtime_id:
+                continue
+            if not _probe_alive(candidate):
                 return None
+            # RuntimeIds are recycled — a rebuilt element can inherit the id
+            # of a dead sibling. Cross-check the recorded name when we have
+            # one so a reused id can't silently resolve to the wrong control.
+            if name:
+                try:
+                    if (candidate.Name or "") != name:
+                        return None
+                except Exception:
+                    return None
+            return candidate
         return None

@@ -5,6 +5,11 @@ from __future__ import annotations
 from windows_mcp.powershell.service import PowerShellExecutor
 
 
+def _q(s: str) -> str:
+    """Escape a value for a PowerShell single-quoted string literal."""
+    return s.replace("'", "''")
+
+
 def lock() -> tuple[str, int]:
     return PowerShellExecutor.execute_command(
         "rundll32.exe user32.dll,LockWorkStation; Start-Sleep -Milliseconds 500; "
@@ -33,12 +38,16 @@ def hibernate() -> tuple[str, int]:
 
 def shutdown(timeout_sec: int = 0, force: bool = False) -> tuple[str, int]:
     flag = "/f" if force else ""
-    return PowerShellExecutor.execute_command(f"shutdown.exe /s /t {timeout_sec} {flag}")
+    return PowerShellExecutor.execute_command(
+        f"shutdown.exe /s /t {int(timeout_sec)} {flag}"
+    )
 
 
 def restart(timeout_sec: int = 0, force: bool = False) -> tuple[str, int]:
     flag = "/f" if force else ""
-    return PowerShellExecutor.execute_command(f"shutdown.exe /r /t {timeout_sec} {flag}")
+    return PowerShellExecutor.execute_command(
+        f"shutdown.exe /r /t {int(timeout_sec)} {flag}"
+    )
 
 
 def logoff() -> tuple[str, int]:
@@ -58,7 +67,9 @@ def get_active_plan() -> tuple[str, int]:
 
 
 def set_active_plan(guid_or_name: str) -> tuple[str, int]:
-    return PowerShellExecutor.execute_command(f"powercfg /setactive {guid_or_name}")
+    return PowerShellExecutor.execute_command(
+        f"powercfg /setactive '{_q(guid_or_name)}'"
+    )
 
 
 def battery_status() -> tuple[str, int]:

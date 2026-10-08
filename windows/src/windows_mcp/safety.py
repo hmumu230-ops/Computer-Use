@@ -106,8 +106,10 @@ def digest(*parts: object) -> str:
     change what the operation does, so a token issued for one payload can't
     authorize a different one (e.g. a task created for notepad.exe must not
     confirm the same task name pointed at malware)."""
+    # JSON encoding avoids separator collisions — ("a|b","c") vs ("a","b|c")
+    # would otherwise hash identically and cross-authorize.
     return hashlib.sha256(
-        "|".join("" if p is None else str(p) for p in parts).encode("utf-8")
+        json.dumps(["" if p is None else str(p) for p in parts]).encode("utf-8")
     ).hexdigest()[:16]
 
 
@@ -170,11 +172,173 @@ _MUTATING_TOKENS = re.compile(
     r"auditpol|wevtutil|gpupdate|secedit|certutil|certreq|bitsadmin|"
     r"driverquery|rundll32|mshta|cscript|wscript|hh\b|control\b|mmc\b|"
     r"taskmgr|eventvwr|services\.msc|taskschd|devmgmt|diskmgmt|compmgmt|lusrmgr|"
-    r"send-mailmessage|compress-|expand-"
+    r"send-mailmessage|compress-|expand-|"
+    r"invoke-[a-z][a-z0-9-]*"  # invoke-* cmdlets dispatch code by name
     r")"
     r")",
     re.IGNORECASE,
 )
+
+# Constructs that evaluate code regardless of the leading verb:
+#   [IO.File]::Delete(x)   — static .NET method dispatch
+#   \\host\share           — UNC coercion → outbound NTLM capture
+_DANGEROUS_SYNTAX = re.compile(r"::|\\\\")
+
+# A segment that is an expression rather than a command invocation —
+# variable/literal/property predicates inside Where-Object {} blocks
+# (e.g. `$_.CPU -gt 10`, `$x = 1`, `if (...)`) are safe to leave ungated.
+_EXPRESSION = re.compile(
+    r"^\s*(?:\$|@|\(|\[|'|\"|!|-?\d|true\b|false\b|null\b|"
+    r"if\b|else\b|elseif\b|for\b|foreach\b|while\b|switch\b|"
+    r"try\b|catch\b|finally\b|return\b|param\b|throw\b|in\b|not\b|"
+    r"[A-Za-z_][\w.-]*\s*=)",  # bare assignment/hashtable entry: name = value
+    re.IGNORECASE,
+)
+
+
+def _split_top(text: str, pipes: bool = False) -> list[str]:
+    """Split on ; \\n && || (and | when `pipes`) at bracket depth 0 only.
+
+    Naive splitting breaks `@{a=1;b={...}}` mid-hashtable and `a | f {x|y}`
+    mid-scriptblock — both let payloads hide inside what looks like a
+    readonly statement.
+    """
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    quote = ""
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(depth - 1, 0)
+        if depth == 0:
+            two = text[i : i + 2]
+            if two in ("&&", "||"):
+                parts.append("".join(cur))
+                cur = []
+                i += 2
+                continue
+            if ch in ";\n" or (pipes and ch == "|"):
+                parts.append("".join(cur))
+                cur = []
+                i += 1
+                continue
+        cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return parts
+
+
+def _code_spans(text: str) -> list[tuple[int, int, str, str]]:
+    """(start, end, inner, kind) for $(...) @(...) @{...} and {...} regions.
+
+    These regions evaluate code wherever they appear — their contents are
+    classified recursively by `command_dangerous` instead of trusting the
+    leading verb of the enclosing stage. kind is 'code' for statement
+    regions and 'hashtable' for @{key=value;...}.
+    """
+    spans: list[tuple[int, int, str, str]] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "'\"":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 1
+            i = j + 1
+            continue
+        inner_start = None
+        close = ""
+        kind = "code"
+        if text.startswith("$(", i) or text.startswith("@(", i):
+            inner_start, close = i + 2, ")"
+        elif text.startswith("@{", i):
+            inner_start, close, kind = i + 2, "}", "hashtable"
+        elif ch == "{":
+            inner_start, close = i + 1, "}"
+        if inner_start is None:
+            i += 1
+            continue
+        open_ch = text[inner_start - 1]
+        depth, j = 1, inner_start
+        while j < n and depth:
+            if text[j] in "'\"":
+                q = text[j]
+                j += 1
+                while j < n and text[j] != q:
+                    j += 1
+                j += 1
+                continue
+            if text[j] == open_ch:
+                depth += 1
+            elif text[j] == close:
+                depth -= 1
+            j += 1
+        spans.append((i, j, text[inner_start : j - 1], kind))
+        i = j
+    return spans
+
+
+def _inner_dangerous(inner: str, kind: str, depth: int) -> bool:
+    """Classify the contents of one extracted code/hashtable span."""
+    if kind == "hashtable":
+        # @{key=value; ...} — entries are data; classify each value/expression
+        for piece in _split_top(inner):
+            piece = piece.strip()
+            if piece and _segment_dangerous(piece, depth):
+                return True
+        return False
+    for piece in _split_top(inner):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if _MUTATING_TOKENS.search(piece):
+            return True
+        if _segment_dangerous(piece, depth):
+            return True
+    return False
+
+
+def _segment_dangerous(segment: str, _depth: int = 0) -> bool:
+    """Classify one statement segment (may contain pipelines + code spans)."""
+    if _depth > 6:  # pathological nesting — treat as dangerous
+        return True
+    # code spans are classified recursively; strip them from the stage text
+    # so the enclosing verb match sees only the pipeline shape.
+    stage = ""
+    pos = 0
+    nested: list[tuple[str, str]] = []
+    for start, end, inner, kind in _code_spans(segment):
+        stage += segment[pos:start] + " "
+        nested.append((inner, kind))
+        pos = end
+    stage += segment[pos:]
+    for inner, kind in nested:
+        if _inner_dangerous(inner, kind, _depth + 1):
+            return True
+    if _DANGEROUS_SYNTAX.search(stage):
+        return True
+    for pipe_stage in _split_top(stage, pipes=True):
+        pipe_stage = pipe_stage.strip()
+        if not pipe_stage:
+            continue
+        if not (_READONLY_VERBS.match(pipe_stage) or _EXPRESSION.match(pipe_stage)):
+            return True
+    return False
 
 
 def command_dangerous(command: str) -> bool:
@@ -182,20 +346,20 @@ def command_dangerous(command: str) -> bool:
 
     Used for tools whose danger level depends on their payload (PowerShell).
     Read-only pipelines pass ungated under the default policy; everything
-    else asks for confirmation.
+    else asks for confirmation. $(...) @(...) and {...} regions evaluate
+    code regardless of the leading verb — their contents are classified
+    recursively, so `echo $(payload)` and `ForEach-Object { payload }`
+    can't smuggle execution past a readonly verb.
     """
     text = command or ""
     if _MUTATING_TOKENS.search(text):
         return True
-    # every statement segment must be recognizably read-only
-    segments = re.split(r"[;\n]|&&|\|\|", text)
-    for segment in segments:
+    # every statement segment must be recognizably read-only; split
+    # depth-aware so ; inside @{...} doesn't fragment a hashtable
+    for segment in _split_top(text):
         segment = segment.strip()
         if not segment:
             continue
-        # split pipelines; each stage must also be read-only
-        stages = [s.strip() for s in segment.split("|") if s.strip()]
-        for stage in stages:
-            if not _READONLY_VERBS.match(stage):
-                return True
+        if _segment_dangerous(segment):
+            return True
     return False

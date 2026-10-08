@@ -109,7 +109,9 @@ def _prepare_env() -> dict[str, str]:
     # server process. Leaking it into a spawned shell makes any Python found
     # on PATH there resolve its standard library against the server's
     # interpreter instead of its own, breaking unrelated installs (#350).
-    env.pop("PYTHONHOME", None)
+    # PYTHONPATH/VIRTUAL_ENV redirect spawned Python the same way.
+    for var in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "PYTHONSTARTUP"):
+        env.pop(var, None)
 
     try:
         machine_vars, machine_path, machine_pathext = _read_reg_env(
@@ -178,13 +180,16 @@ class PowerShellExecutor:
             command: str, timeout: int = 10, shell: str | None = None
     ) -> tuple[str, int]:
         try:
-            # $OutputEncoding: controls how PS5.1 encodes output written to its stdout pipe.
-            # Without this set to UTF-8, PS5.1 uses the system codepage and native process
-            # stdout is silently lost when Python reads the pipe.
-            # [Console]::OutputEncoding: controls how PS decodes bytes from native exe stdout.
+            # Encoding contract: the pipe is UTF-8 end-to-end.
+            # - [Console]::OutputEncoding=UTF8 makes PS emit UTF-8 and decode
+            #   captured native output as UTF-8.
+            # - chcp 65001 makes native children (netsh, whoami, powercfg)
+            #   write UTF-8 on the same pipe. Without it their OEM/ACP bytes
+            #   hit the UTF-8 decoder → silent mojibake on localized Windows.
             utf8_command = (
                 "$OutputEncoding = [System.Text.Encoding]::UTF8; "
                 "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                "try { chcp 65001 | Out-Null } catch {}; "
                 f"{command}"
             )
             encoded = base64.b64encode(utf8_command.encode("utf-16le")).decode("ascii")
@@ -194,14 +199,36 @@ class PowerShellExecutor:
             # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_ansi_terminals#disabling-ansi-output
             env["NO_COLOR"] = "1"
 
-            shell = shell or ("pwsh" if shutil.which("pwsh") else "powershell")
+            if shell:
+                # internal callers only — refuse arbitrary executables as "shell"
+                base = os.path.basename(shell).lower().replace(".exe", "")
+                if base not in ("powershell", "pwsh"):
+                    return "shell must be 'powershell' or 'pwsh'", 1
+            else:
+                # probe the merged PATH, not the (possibly stripped) host env
+                shell = "pwsh" if shutil.which("pwsh", path=env.get("PATH", "")) else "powershell"
 
-            args = [shell, "-NoProfile"]
+            # -NonInteractive: stdin is DEVNULL — a command that prompts would
+            # otherwise hang until the timeout instead of failing fast.
+            args = [shell, "-NoProfile", "-NonInteractive"]
             # Only older Windows PowerShell (5.1) uses -OutputFormat Text successfully here
             shell_name = os.path.basename(shell).lower().replace(".exe", "")
             if shell_name == "powershell":
                 args.extend(["-OutputFormat", "Text"])
             args.extend(["-EncodedCommand", encoded])
+
+            # CreateProcess caps the command line at 32,767 chars; the base64
+            # EncodedCommand inflates ~2.7×, so large commands die in the OS
+            # with an opaque error. Catch it early with a real message.
+            if sum(len(a) + 1 for a in args) > 30_000:
+                return (
+                    "Command too large for a single PowerShell invocation "
+                    "(>~11 KB of script). Split it into smaller commands or "
+                    "write it to a script file first.",
+                    1,
+                )
+
+            timeout = min(max(int(timeout), 1), 300)
 
             result = run_with_graceful_timeout(
                 args,
@@ -218,7 +245,9 @@ class PowerShellExecutor:
                 stdout = stdout.decode("utf-8", errors="replace")
             if isinstance(stderr, bytes):
                 stderr = stderr.decode("utf-8", errors="replace")
-            output = stdout or stderr
+            # keep both streams — `stdout or stderr` silently dropped the
+            # real error message whenever stdout wasn't empty (or vice versa)
+            output = "\n".join(part for part in (stdout, stderr) if part).strip()
             # If the command failed with "Access is denied" and we aren't elevated, add a helpful hint
             if result.returncode != 0 and "Access is denied" in output and not is_elevated():
                 output += (
@@ -226,7 +255,11 @@ class PowerShellExecutor:
                     "The Windows-MCP server is currently running at a lower integrity level."
                 )
             return output, result.returncode
-        except subprocess.TimeoutExpired:
-            return "Command execution timed out", 1
+        except subprocess.TimeoutExpired as e:
+            partial = e.stdout or b""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", errors="replace")
+            suffix = f"\npartial output:\n{partial.strip()}" if partial and partial.strip() else ""
+            return f"Command execution timed out{suffix}", 1
         except Exception as e:
             return f"Command execution failed: {type(e).__name__}: {e}", 1

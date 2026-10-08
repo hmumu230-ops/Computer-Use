@@ -17,7 +17,10 @@ def _as_args(value: list[str] | str | None) -> list[str]:
     if isinstance(value, list):
         args = value
     else:
-        args = json.loads(value)
+        try:
+            args = json.loads(value)
+        except json.JSONDecodeError:
+            raise ValueError(f'args must be a JSON array of strings, got {value!r}')
     if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
         raise ValueError("args must be a list of strings")
     return args

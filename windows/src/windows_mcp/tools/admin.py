@@ -56,7 +56,9 @@ def register(mcp, *, get_desktop, get_analytics):
         if action != "list" and not name:
             raise ValueError(f"name required for action='{action}'")
 
-        key = f"service.{action}:{name}"
+        # bind the effect parameters too — a token for 'stop force=false'
+        # must not authorize 'stop force=true', nor a different startup_type
+        key = f"service.{action}:{name}:{safety.digest(startup_type, _as_bool(force))}"
         if action in ("start", "stop", "restart", "startup_type"):
             desc = {
                 "start": f"start service {name}",
@@ -117,6 +119,9 @@ def register(mcp, *, get_desktop, get_analytics):
         if action != "list" and not name:
             raise ValueError(f"name required for action='{action}'")
 
+        if action == "create" and not program:
+            raise ValueError("program required for action='create'")
+
         if action in ("run", "enable", "disable", "delete", "create"):
             key = f"task.{action}:{path}:{name}"
             if action == "create":
@@ -136,8 +141,6 @@ def register(mcp, *, get_desktop, get_analytics):
             "create": lambda: tasks.create_task(name, program or "", arguments, trigger, run_level),
             "delete": lambda: tasks.delete_task(name, path),
         }
-        if action == "create" and not program:
-            raise ValueError("program required for action='create'")
         result = dispatch[action]()
         if action in ("run", "enable", "disable", "delete", "create"):
             safety.audit(f"task.{action}", name)
@@ -176,14 +179,15 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "set" and value is None:
             raise ValueError("value required for action='set'")
         if action in ("set", "delete"):
-            # user-scope writes to the gate policy var would persistently
-            # downgrade the safety gate for future sessions — always dangerous
-            protected = name.strip().upper() in {"WINDOWS_MCP_REQUIRE_CONFIRM"}
+            # Every persistent env write is dangerous under the default
+            # policy: user-scope Path/ComSpec/PSModulePath/NODE_OPTIONS
+            # hijack every future process and survive reboots. The value is
+            # bound into the token — 'set PATH' must not authorize any value.
             gated = safety.gate(
-                f"env.{action}:{scope}:{name}",
+                f"env.{action}:{scope}:{name}:{safety.digest(value)}",
                 f"{action} environment variable {scope}:{name}",
                 confirm,
-                dangerous=scope == "machine" or protected,
+                dangerous=True,
             )
             if gated:
                 return gated

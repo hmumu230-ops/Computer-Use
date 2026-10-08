@@ -8,9 +8,11 @@ from windows_mcp.powershell.service import PowerShellExecutor
 
 def whoami() -> dict:
     out, _ = PowerShellExecutor.execute_command("whoami")
+    # 'Group Name' header is localized — pick the first CSV column
+    # positionally so non-English Windows still returns the group list.
     groups_out, _ = PowerShellExecutor.execute_command(
         "(whoami /groups /fo csv | ConvertFrom-Csv | "
-        "Select-Object -ExpandProperty 'Group Name') -join ', '"
+        "ForEach-Object { $_.PSObject.Properties.Value[0] }) -join ', '"
     )
     return {
         "user": out.strip(),

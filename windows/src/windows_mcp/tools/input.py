@@ -34,6 +34,19 @@ def _resolve_label(desktop: Any, label: int) -> list[int]:
         raise ValueError(f"Failed to find element with label {label}: {e}")
 
 
+def _xy_alias(x: int | float | None, y: int | float | None) -> list[int] | None:
+    """Browser-tool-style x=/y= kwargs → loc=[x, y]. Partial pairs fail."""
+    if x is None and y is None:
+        return None
+    if (
+        not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (x, y))
+        or x is None
+        or y is None
+    ):
+        raise ValueError("x and y must both be numbers when used instead of loc")
+    return [int(x), int(y)]
+
+
 def _resolve_target(
     desktop: Any,
     loc: list | None,
@@ -68,7 +81,7 @@ def _resolve_target(
         # resolve to the LAST element — a click on the wrong control
         raise ValueError(f"label must be >= 0, got {label}")
     if loc is None or len(loc) != 2:
-        raise ValueError("Provide ref, label, or loc=[x, y].")
+        raise ValueError("Provide ref, label, loc=[x, y], or x=/y=.")
     if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in loc):
         raise ValueError("loc must contain exactly 2 numbers [x, y]")
     return int(loc[0]), int(loc[1]), f"({loc[0]},{loc[1]})", None
@@ -111,7 +124,10 @@ def _as_loc(value: list | str | None) -> list | None:
     """
     if value is None or isinstance(value, list):
         return value
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(f"expected a list like [x, y], got {value!r}")
 
 
 def _as_point(value: object, name: str) -> list[int]:
@@ -287,7 +303,7 @@ def register(
             "method controls execution: 'auto' (default) tries UIA patterns (invoke/toggle/select — no cursor "
             "movement, works in background) then falls back to synthetic input; 'invoke' requires a pattern and "
             "never touches the mouse (errors when unsupported); 'synthetic' always uses real mouse input. "
-            "Provide one of ref, label, or loc."
+            "Provide one of ref, label, loc, or x=/y=."
         ),
         annotations=ToolAnnotations(
             title="Click",
@@ -305,10 +321,19 @@ def register(
         button: Literal["left", "right", "middle"] = "left",
         clicks: int = 1,
         method: Literal["auto", "invoke", "synthetic"] = "auto",
+        x: int | float | None = None,
+        y: int | float | None = None,
+        numClicks: int | None = None,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
+        if loc is None:
+            loc = _xy_alias(x, y)
         loc = _as_loc(loc)
+        if numClicks is not None:
+            if not isinstance(numClicks, int) or isinstance(numClicks, bool):
+                raise ValueError("numClicks must be an integer")
+            clicks = numClicks
         method = _check_method(method)
         x, y, via, locator = _resolve_target(desktop, loc, label, ref)
         if not isinstance(clicks, int) or clicks < 0 or clicks > 5:
@@ -348,7 +373,7 @@ def register(
 
     @mcp.tool(
         name="Type",
-        description="Types text at specified coordinates [x, y], a UI element's label/id, or an @eN ref from the latest Snapshot (preferred). Set clear=True to clear existing text first, False to append. Set press_enter=True to submit after typing. Set caret_position to 'start' (beginning), 'end' (end), or 'idle' (default). method: 'auto' uses UIA ValuePattern (instant, no focus steal) when clear=True and the element supports it; 'invoke' requires it; 'synthetic' always simulates keystrokes. Provide one of ref, label, or loc.",
+        description="Types text at coordinates [x, y] (or x=/y=), a UI element's label/id, or an @eN ref from the latest Snapshot (preferred). Omit all locators to type into the currently focused element — e.g. right after a Click. Set clear=True to clear existing text first, False to append. Set press_enter=True to submit after typing. Set caret_position to 'start' (beginning), 'end' (end), or 'idle' (default). method: 'auto' uses UIA ValuePattern (instant, no focus steal) when clear=True and the element supports it; 'invoke' requires it; 'synthetic' always simulates keystrokes.",
         annotations=ToolAnnotations(
             title="Type",
             readOnlyHint=False,
@@ -368,12 +393,38 @@ def register(
         press_enter: bool | str = False,
         method: Literal["auto", "invoke", "synthetic"] = "auto",
         raw: bool | str = False,
+        x: int | float | None = None,
+        y: int | float | None = None,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
+        if loc is None:
+            loc = _xy_alias(x, y)
         loc = _as_loc(loc)
         method = _check_method(method)
         raw = _as_bool(raw, "raw")
+
+        # No locator at all → type into whatever currently has focus. This is
+        # the natural "click then type" agent flow; requiring a locator forced
+        # a real failure mode (Type called bare after a Click).
+        focused = ref is None and label is None and loc is None
+        if focused:
+            if _pattern_required(method):
+                raise ValueError(
+                    "method='invoke' needs an element target; omit ref/label/loc "
+                    "only for synthetic typing into the focused element."
+                )
+            desktop.type(
+                loc=None,
+                text=text,
+                caret_position=caret_position,
+                clear=clear,
+                press_enter=press_enter,
+                raw=raw,
+            )
+            suffix = " (scan code)" if raw else ""
+            return f"Typed {text} into the focused element{suffix}."
+
         x, y, via, locator = _resolve_target(desktop, loc, label, ref)
         clear_bool = _as_bool(clear, "clear")
         enter_bool = _as_bool(press_enter, "press_enter")
