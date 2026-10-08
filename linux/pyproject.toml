@@ -4,14 +4,14 @@ version = "0.3.0"
 description = "MCP server: Linux computer-use tools (AT-SPI, X11+Wayland, system toolkit) for Claude Code, OpenCode, and any MCP-aware agent."
 requires-python = ">=3.10"
 dependencies = ["mcp>=1.2.0"]
-
-[project.optional-dependencies]
-ocr = ["rapidocr>=3.0", "pillow>=10.0"]
-dev = ["pytest>=8.0", "psutil>=5.9"]
 authors = [{name = "Tak1tak", email = "tak1tak@users.noreply.github.com"}]
 license = {text = "MIT"}
 readme = "README.md"
 keywords = ["mcp", "computer-use", "linux", "x11", "at-spi", "xdotool", "claude-code", "opencode"]
+
+[project.optional-dependencies]
+ocr = ["rapidocr>=3.0", "pillow>=10.0"]
+dev = ["pytest>=8.0", "psutil>=5.9"]
 
 [project.urls]
 Homepage = "https://github.com/tak-uukti/linux-computer-use"

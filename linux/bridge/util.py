@@ -11,10 +11,18 @@ import subprocess
 import sys
 import threading
 
-_ENV = dict(os.environ)
-_ENV["LC_ALL"] = "C"
-_ENV["SYSTEMD_PAGER"] = ""
-_ENV["PAGER"] = "cat"
+def _base_env() -> dict:
+    """Subprocess env computed at call time — never a stale snapshot.
+
+    `env_for_gui()` may inject DISPLAY/DBUS into os.environ after import;
+    a module-level `dict(os.environ)` captured before that point would
+    hide the recovered session from every spawned tool.
+    """
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env["SYSTEMD_PAGER"] = ""
+    env["PAGER"] = "cat"
+    return env
 
 
 def log(msg: str) -> None:
@@ -31,7 +39,7 @@ def run(cmd: list[str], timeout: float = 10.0, check: bool = False,
     """Run a command, POSIX-locale, no pager. Raises TimeoutExpired/FileNotFoundError."""
     return subprocess.run(
         cmd, capture_output=True, text=not binary, timeout=timeout,
-        check=check, env=env or _ENV, input=input_text,
+        check=check, env=env or _base_env(), input=input_text,
     )
 
 
