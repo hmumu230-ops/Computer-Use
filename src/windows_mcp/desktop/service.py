@@ -23,7 +23,9 @@ from markdownify import markdownify
 from fuzzywuzzy import process
 from time import sleep, time, perf_counter
 from psutil import Process
+import functools
 import math
+import threading
 import win32process
 import win32gui
 import win32con
@@ -56,6 +58,22 @@ _KEY_ALIASES = {
 def _snapshot_profile_enabled() -> bool:
     value = os.getenv("WINDOWS_MCP_PROFILE_SNAPSHOT", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Synthetic input is a process-wide shared resource: cursor position, modifier
+# state and the SendKeys queue. Tools run in asyncio.to_thread workers, so two
+# concurrent calls could interleave mouse moves and key events mid-gesture.
+# Serialize every input-emitting method. RLock because multi_edit calls type.
+_INPUT_LOCK = threading.RLock()
+
+
+def _serialized_input(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _INPUT_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def _escape_text_for_sendkeys(text: str) -> str:
@@ -740,6 +758,7 @@ class Desktop:
             return None
         return self.ref_store.resolve_index(label)
 
+    @_serialized_input
     def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1):
         if isinstance(loc, list):
             x, y = loc[0], loc[1]
@@ -757,11 +776,15 @@ class Desktop:
                 else:
                     uia.Click(x, y)
             case "right":
-                for _ in range(clicks):
-                    uia.RightClick(x, y)
+                # space multi-clicks like left — back-to-back synthetic clicks
+                # collapse into one at some drivers/UIA cadences
+                dbl_wait = uia.GetDoubleClickTime() / 2000.0
+                for i in range(clicks):
+                    uia.RightClick(x, y, waitTime=dbl_wait if i < clicks - 1 else 0.5)
             case "middle":
-                for _ in range(clicks):
-                    uia.MiddleClick(x, y)
+                dbl_wait = uia.GetDoubleClickTime() / 2000.0
+                for i in range(clicks):
+                    uia.MiddleClick(x, y, waitTime=dbl_wait if i < clicks - 1 else 0.5)
 
     # Strings longer than this typed via clipboard paste instead of
     # per-key SendKeys. SendKeys at high cadence loses keystrokes on
@@ -773,6 +796,7 @@ class Desktop:
     # so escape sequences ({Enter}, {Tab}, …) still work.
     _LONG_TEXT_PASTE_THRESHOLD = 20
 
+    @_serialized_input
     def type(
         self,
         loc: tuple[int, int],
@@ -827,23 +851,39 @@ class Desktop:
         Plain-text only — control chars (newlines, tabs, braces) need to
         route through SendKeys instead so escape sequences are honored.
         """
-        prior = None
-        try:
-            prior = uia.GetClipboardText()
-        except Exception:
-            pass
-        uia.SetClipboardText(text)
-        # Tiny pause so the OS clipboard write settles before Ctrl+V reads.
-        sleep(0.05)
-        uia.SendKeys("{Ctrl}v", waitTime=0.05)
-        # Restore prior clipboard so we don't surprise other tools.
-        if prior is not None:
-            sleep(0.05)
+        from windows_mcp.clipboard import service as clipboard_service
+
+        # Hold the shared lock across the whole read->paste->restore cycle so
+        # a concurrent Clipboard/Type call can't swap payloads mid-flight.
+        with clipboard_service.CLIPBOARD_LOCK:
+            prior = None
             try:
-                uia.SetClipboardText(prior)
+                prior = clipboard_service.get_content()
             except Exception:
                 pass
+            if not uia.SetClipboardText(text):
+                # Setting failed — Ctrl+V would paste whatever the user had,
+                # which is worse than failing loudly.
+                raise RuntimeError("failed to set clipboard text for paste; aborting Ctrl+V")
+            # Tiny pause so the OS clipboard write settles before Ctrl+V reads.
+            sleep(0.05)
+            uia.SendKeys("{Ctrl}v", waitTime=0.05)
+            # Give the target a beat to consume the paste before restoring —
+            # restoring too fast can race the paste and re-inject old content.
+            sleep(0.15)
+            if prior is not None:
+                try:
+                    if prior.kind == "text" and prior.text is not None:
+                        uia.SetClipboardText(prior.text)
+                    elif prior.kind == "image" and prior.image_png:
+                        clipboard_service.set_image_bytes(prior.image_png)
+                    elif prior.kind == "files" and prior.files:
+                        clipboard_service.set_files(prior.files)
+                    # 'empty' needs no restore
+                except Exception:
+                    pass
 
+    @_serialized_input
     def scroll(
         self,
         loc: tuple[int, int] = None,
@@ -851,6 +891,12 @@ class Desktop:
         direction: Literal["up", "down", "left", "right"] = "down",
         wheel_times: int = 1,
     ) -> str | None:
+        try:
+            wheel_times = int(wheel_times)
+        except (TypeError, ValueError):
+            return 'Invalid wheel_times. Use an integer between 1 and 100.'
+        if wheel_times < 1 or wheel_times > 100:
+            return 'Invalid wheel_times. Use an integer between 1 and 100.'
         if loc:
             self.move(loc)
         match type:
@@ -864,16 +910,17 @@ class Desktop:
                         return 'Invalid direction. Use "up" or "down".'
             case "horizontal":
                 match direction:
-                    case "left":
+                    case "left" | "right":
                         uia.PressKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                        uia.WheelUp(wheel_times)
-                        sleep(0.05)
-                        uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                    case "right":
-                        uia.PressKey(uia.Keys.VK_SHIFT, waitTime=0.05)
-                        uia.WheelDown(wheel_times)
-                        sleep(0.05)
-                        uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
+                        try:
+                            if direction == "left":
+                                uia.WheelUp(wheel_times)
+                            else:
+                                uia.WheelDown(wheel_times)
+                            sleep(0.05)
+                        finally:
+                            # never leave Shift latched if the wheel call throws
+                            uia.ReleaseKey(uia.Keys.VK_SHIFT, waitTime=0.05)
                     case _:
                         return 'Invalid direction. Use "left" or "right".'
             case _:
@@ -904,6 +951,7 @@ class Desktop:
             raise ValueError(f"{name} must contain exactly 2 integers")
         return x, y
 
+    @_serialized_input
     def drag(
         self,
         loc: tuple[int, int] | list[int],
@@ -927,10 +975,12 @@ class Desktop:
             "duration": effective_duration,
         }
 
+    @_serialized_input
     def move(self, loc: tuple[int, int]):
         x, y = loc
         uia.MoveTo(x, y, moveSpeed=10)
 
+    @_serialized_input
     def shortcut(self, shortcut: str, raw: bool | str = False):
         if raw is True or (isinstance(raw, str) and raw.lower() == "true"):
             return self._shortcut_scancode(shortcut)
@@ -980,12 +1030,18 @@ class Desktop:
             vks.append(vk)
         if not vks:
             raise ValueError(f"empty shortcut {shortcut!r}")
-        for vk in vks:
-            uia.SendScanCode(vk, keyUp=False)
-            sleep(0.01)
-        for vk in reversed(vks):
-            uia.SendScanCode(vk, keyUp=True)
-            sleep(0.01)
+        pressed: list[int] = []
+        try:
+            for vk in vks:
+                uia.SendScanCode(vk, keyUp=False)
+                pressed.append(vk)
+                sleep(0.01)
+        finally:
+            # release whatever got pressed even if a SendScanCode throws,
+            # otherwise modifiers stay latched system-wide
+            for vk in reversed(pressed):
+                uia.SendScanCode(vk, keyUp=True)
+                sleep(0.01)
 
     def _type_scancode(self, text: str):
         """Type text as raw scan codes; unmapped chars fall back to
@@ -1012,26 +1068,38 @@ class Desktop:
                 mod_vks.append(uia.Keys.VK_CONTROL)
             if mods & 4:
                 mod_vks.append(uia.Keys.VK_MENU)
-            for m in mod_vks:
-                uia.SendScanCode(m, keyUp=False)
-            uia.SendScanCode(vk, keyUp=False)
-            uia.SendScanCode(vk, keyUp=True)
-            for m in reversed(mod_vks):
-                uia.SendScanCode(m, keyUp=True)
+            pressed: list[int] = []
+            try:
+                for m in mod_vks:
+                    uia.SendScanCode(m, keyUp=False)
+                    pressed.append(m)
+                uia.SendScanCode(vk, keyUp=False)
+                uia.SendScanCode(vk, keyUp=True)
+            finally:
+                for m in reversed(pressed):
+                    uia.SendScanCode(m, keyUp=True)
             sleep(0.01)
 
+    @_serialized_input
     def multi_select(self, press_ctrl: bool | str = False, locs: list[tuple[int, int]] = []):
         press_ctrl = press_ctrl is True or (
             isinstance(press_ctrl, str) and press_ctrl.lower() == "true"
         )
         if press_ctrl:
             uia.PressKey(uia.Keys.VK_CONTROL, waitTime=0.05)
-        for loc in locs:
-            x, y = loc
-            uia.Click(x, y, waitTime=0.2)
-            sleep(0.5)
-        uia.ReleaseKey(uia.Keys.VK_CONTROL, waitTime=0.05)
+        try:
+            for loc in locs:
+                x, y = loc
+                uia.Click(x, y, waitTime=0.2)
+                sleep(0.5)
+        finally:
+            # only release Ctrl when *we* pressed it — previously it released
+            # unconditionally, cancelling a physically held Ctrl, and an
+            # exception mid-loop left our own Ctrl latched forever.
+            if press_ctrl:
+                uia.ReleaseKey(uia.Keys.VK_CONTROL, waitTime=0.05)
 
+    @_serialized_input
     def multi_edit(self, locs: list[tuple[int, int, str]]):
         for loc in locs:
             x, y, text = loc
@@ -1548,6 +1616,9 @@ class Desktop:
             bounding_box=clipped_box,
             center=clipped_box.get_center(),
             metadata=node.metadata,
+            # keep the live locator — dropping it silently demoted every ref
+            # in a region snapshot to a frozen-coordinate synthetic
+            locator=node.locator,
         )
 
     def _filter_scroll_node_to_region(self, node, region: BoundingBox):
@@ -1561,6 +1632,7 @@ class Desktop:
             bounding_box=clipped_box,
             center=clipped_box.get_center(),
             metadata=node.metadata,
+            locator=node.locator,
         )
 
     def _filter_semantic_node_to_region(
@@ -1594,6 +1666,7 @@ class Desktop:
             center=clipped_box.get_center() if clipped_box is not None else node.center,
             bounding_box=clipped_box,
             metadata=dict(node.metadata),
+            locator=node.locator,
         )
         filtered_node.children = filtered_children
         return filtered_node
