@@ -60,7 +60,9 @@ def register(mcp, *, get_desktop, get_analytics):
                     f"fs.{mode}:{safety.digest(path, destination)}",
                     f"{mode} '{path}'" + (f" -> '{destination}'" if destination else ""),
                     confirm,
-                    dangerous=mode in ("write", "move", "delete") or bool(overwrite),
+                    # copy writes files even without overwrite — it's a
+                    # mutation primitive, not a read
+                    dangerous=True,
                 )
                 if gated:
                     return gated

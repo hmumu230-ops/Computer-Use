@@ -57,8 +57,12 @@ def list_printers() -> tuple[Any, int]:
 
 
 def set_default_printer(name: str) -> tuple[Any, int]:
+    # Value comparison, not a WQL filter — a quote/dollar/backtick in the
+    # printer name can't break out of the string context this way.
     return _ps(
-        f"(Get-CimInstance Win32_Printer -Filter \"Name='{_q(name)}'\") "
-        "| Invoke-CimMethod -MethodName SetDefaultPrinter | Out-Null; "
-        f"'{name} set as default'"
+        f"$name = '{_q(name)}'; "
+        "$p = Get-CimInstance Win32_Printer | Where-Object { $_.Name -eq $name }; "
+        "if ($p) { $p | Invoke-CimMethod -MethodName SetDefaultPrinter | Out-Null; "
+        f"'{_q(name)} set as default' }} "
+        "else { throw \"printer not found\" }"
     )

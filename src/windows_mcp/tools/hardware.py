@@ -98,7 +98,7 @@ def register(mcp, *, get_desktop, get_analytics):
             if width is None or height is None:
                 raise ValueError("width and height required for set_resolution")
             gated = safety.gate(
-                f"display.set_resolution:{width}x{height}",
+                f"display.set_resolution:{safety.digest(device_name, width, height, hz)}",
                 f"change display resolution to {width}x{height}",
                 confirm,
                 dangerous=True,
@@ -160,7 +160,7 @@ def register(mcp, *, get_desktop, get_analytics):
                 f"device.{action}:{instance_id}",
                 f"{action} device {instance_id}",
                 confirm,
-                dangerous=action == "disable",
+                dangerous=True,  # enabling hardware is a write, not just disabling
             )
             if gated:
                 return gated
@@ -174,7 +174,7 @@ def register(mcp, *, get_desktop, get_analytics):
                 f"device.set_default_printer:{name}",
                 f"set default printer to {name}",
                 confirm,
-                dangerous=False,
+                dangerous=True,
             )
             if gated:
                 return gated

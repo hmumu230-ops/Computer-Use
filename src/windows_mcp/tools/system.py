@@ -49,11 +49,25 @@ def register(mcp, *, get_desktop, get_analytics):
         action = action.strip().lower()
         force_b = force is True or (isinstance(force, str) and force.lower() == "true")
 
-        dangerous = {"shutdown", "restart", "logoff", "sleep", "hibernate"}
+        # set_power_plan switches machine power policy; cancel_shutdown aborts
+        # a shutdown an admin may have scheduled — both are meaningful writes,
+        # not read-only probes.
+        dangerous = {
+            "shutdown",
+            "restart",
+            "logoff",
+            "sleep",
+            "hibernate",
+            "set_power_plan",
+            "cancel_shutdown",
+        }
         readonly = {"power_plans", "get_power_plan", "battery", "uptime"}
-        valid = dangerous | readonly | {"lock", "cancel_shutdown", "set_power_plan"}
+        valid = dangerous | readonly | {"lock"}
         if action not in valid:
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
+
+        if action == "set_power_plan" and not plan:
+            raise ValueError("plan is required for set_power_plan (guid or scheme name)")
 
         if action not in readonly:
             # bind every parameter that changes what the action does
@@ -78,10 +92,8 @@ def register(mcp, *, get_desktop, get_analytics):
             "battery": power.battery_status,
             "uptime": power.uptime,
         }
-        if action == "set_power_plan" and not plan:
-            raise ValueError("plan is required for set_power_plan (guid or scheme name)")
         out, rc = dispatch[action]()
-        if action in dangerous and rc == 0:
+        if action not in readonly and rc == 0:
             safety.audit(
                 f"system.{action}:{safety.digest(timeout_sec, force_b, plan)}",
                 f"System action '{action}' executed",
