@@ -25,7 +25,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "FileSystem-Tool")
+    @with_analytics(get_analytics, "FileSystem-Tool")
     def file_system_tool(
         mode: Literal['read', 'write', 'copy', 'move', 'delete', 'list', 'search', 'info'],
         path: str,

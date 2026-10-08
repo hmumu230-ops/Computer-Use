@@ -22,7 +22,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Registry-Tool")
+    @with_analytics(get_analytics, "Registry-Tool")
     def registry_tool(
         mode: Literal['get', 'set', 'delete', 'list'],
         path: str,

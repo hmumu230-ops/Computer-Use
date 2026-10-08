@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,11 +100,14 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
 
     server = data.get("server", {})
     security = data.get("security", {})
     tools = data.get("tools", {})
+    for section_name, section in (("server", server), ("security", security), ("tools", tools)):
+        if not isinstance(section, dict):
+            raise ValueError(f"[{section_name}] must be a TOML table, got {section!r}")
 
     _VALID_TRANSPORTS = {"stdio", "sse", "streamable-http"}
     if "transport" in server:
@@ -158,6 +162,14 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
     return cfg
 
 
+def _toml_str(value: object) -> str:
+    """JSON-escaped string — a strict subset of TOML basic-string syntax, so
+    Windows paths ('C:\\Users\\…') and quotes can't produce invalid TOML."""
+    import json as _json
+
+    return _json.dumps(str(value))
+
+
 def write_config(cfg: WindowsMCPConfig, path: Path) -> None:
     """Serialize *cfg* to TOML at *path*, writing only non-default values."""
     lines: list[str] = []
@@ -165,19 +177,19 @@ def write_config(cfg: WindowsMCPConfig, path: Path) -> None:
     sd, dd = cfg.server, ServerConfig()
     server_lines: list[str] = []
     if sd.transport != dd.transport:
-        server_lines.append(f'transport = "{sd.transport}"')
+        server_lines.append(f"transport = {_toml_str(sd.transport)}")
     if sd.host != dd.host:
-        server_lines.append(f'host = "{sd.host}"')
+        server_lines.append(f"host = {_toml_str(sd.host)}")
     if sd.port != dd.port:
         server_lines.append(f"port = {sd.port}")
     if sd.allow_insecure_remote:
         server_lines.append("allow_insecure_remote = true")
     if sd.auth_key:
-        server_lines.append(f'auth_key = "{sd.auth_key}"')
+        server_lines.append(f"auth_key = {_toml_str(sd.auth_key)}")
     if sd.ssl_certfile:
-        server_lines.append(f'ssl_certfile = "{sd.ssl_certfile}"')
+        server_lines.append(f"ssl_certfile = {_toml_str(sd.ssl_certfile)}")
     if sd.ssl_keyfile:
-        server_lines.append(f'ssl_keyfile = "{sd.ssl_keyfile}"')
+        server_lines.append(f"ssl_keyfile = {_toml_str(sd.ssl_keyfile)}")
     if sd.stateless_http:
         server_lines.append("stateless_http = true")
     if server_lines:
@@ -186,20 +198,24 @@ def write_config(cfg: WindowsMCPConfig, path: Path) -> None:
     sec = cfg.security
     sec_lines: list[str] = []
     if sec.ip_allowlist:
-        items = ", ".join(f'"{ip}"' for ip in sec.ip_allowlist)
+        items = ", ".join(_toml_str(ip) for ip in sec.ip_allowlist)
         sec_lines.append(f"ip_allowlist = [{items}]")
     if sec.cors_origins:
-        items = ", ".join(f'"{o}"' for o in sec.cors_origins)
+        items = ", ".join(_toml_str(o) for o in sec.cors_origins)
         sec_lines.append(f"cors_origins = [{items}]")
     if sec.oauth_client_id:
-        sec_lines.append(f'oauth_client_id = "{sec.oauth_client_id}"')
+        sec_lines.append(f"oauth_client_id = {_toml_str(sec.oauth_client_id)}")
     if sec.oauth_client_secret:
-        sec_lines.append(f'oauth_client_secret = "{sec.oauth_client_secret}"')
+        sec_lines.append(f"oauth_client_secret = {_toml_str(sec.oauth_client_secret)}")
     if sec_lines:
         lines += ["[security]"] + sec_lines + [""]
 
     if cfg.tools.exclude:
-        items = ", ".join(f'"{t}"' for t in cfg.tools.exclude)
+        items = ", ".join(_toml_str(t) for t in cfg.tools.exclude)
         lines += ["[tools]", f"exclude = [{items}]", ""]
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    # Atomic write — a killed process mid-write used to leave a truncated
+    # config that then broke every subsequent command.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines), encoding="utf-8")
+    os.replace(tmp, path)

@@ -28,7 +28,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Clipboard-Tool")
+    @with_analytics(get_analytics, "Clipboard-Tool")
     def clipboard_tool(
         mode: Literal["get", "set", "set_image", "set_files"],
         text: str | None = None,

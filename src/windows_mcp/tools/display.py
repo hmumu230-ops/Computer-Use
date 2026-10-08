@@ -42,7 +42,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "DisplayInventory-Tool")
+    @with_analytics(get_analytics, "DisplayInventory-Tool")
     def display_inventory_tool(ctx: Context = None) -> list[dict[str, object]]:
         displays = get_desktop().get_displays()
         return [

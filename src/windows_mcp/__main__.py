@@ -91,9 +91,7 @@ def _http_middleware(
         Middleware(OptionsMiddleware, allowed_origins=cors_origins or []),
     ]
     if allowed_hosts:
-        from starlette.middleware.trustedhost import TrustedHostMiddleware
-
-        middleware.append(Middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts))
+        middleware.append(Middleware(_AllowedHostMiddleware, allowed_hosts=allowed_hosts))
     if cors_origins:
         middleware.append(
             Middleware(
@@ -357,6 +355,45 @@ class _LegacyAwareGroup(click.Group):
         return None
 
 
+class _AllowedHostMiddleware:
+    """Pure-ASGI Host allowlist that understands IPv6 literals.
+
+    Starlette's TrustedHostMiddleware does ``host.split(":")[0]`` which turns
+    ``[::1]:8000`` into ``"["`` — IPv6 loopback clients can never match, so
+    --host ::1 was unreachable. This parser strips brackets and the port,
+    then compares the bare address.
+    """
+
+    def __init__(self, app, allowed_hosts: list[str]):
+        self.app = app
+        self.allowed = {h.strip().lower().strip("[]") for h in allowed_hosts}
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            host = ""
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    host = value.decode("latin-1").strip().lower()
+                    break
+            if host:
+                if host.startswith("["):
+                    host = host[1:].split("]", 1)[0]
+                elif ":" in host:
+                    host = host.split(":", 1)[0]
+                if host not in self.allowed:
+                    body = b"Invalid host header"
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 400,
+                            "headers": [(b"content-type", b"text/plain")],
+                        }
+                    )
+                    await send({"type": "http.response.body", "body": body})
+                    return
+        await self.app(scope, receive, send)
+
+
 def _apply_tool_filter(
     mcp, explicit_tools: list[str] | None, exclude_tools: list[str] | None
 ) -> None:
@@ -395,10 +432,22 @@ def _apply_tool_filter(
         registered = set(tools_dict.keys())
 
     if explicit_tools:
-        keep = {t for t in explicit_tools if t in registered}
+        unknown = set(explicit_tools) - registered
+        if unknown:
+            available = ", ".join(sorted(registered))
+            raise click.ClickException(
+                f"--tools contains unknown tool name(s): {sorted(unknown)}. "
+                f"Registered tools: {available}"
+            )
+        keep = set(explicit_tools)
         for name in registered - keep:
             _remove(name)
     elif exclude_tools:
+        unknown = set(exclude_tools) - registered
+        if unknown:
+            logger.warning(
+                "--exclude-tools name(s) not registered (ignored): %s", sorted(unknown)
+            )
         for name in exclude_tools:
             if name in registered:
                 _remove(name)
@@ -526,7 +575,9 @@ def main():
 )
 @click.option(
     "--exclude-tools",
-    help="Comma-separated list of tools to remove from the active set (e.g. 'PowerShell,Registry').",
+    "--disable-tools",
+    "exclude_tools",
+    help="Comma-separated list of tools to remove from the active set (e.g. 'PowerShell,Registry'). --disable-tools is a deprecated alias.",
     default=None,
     envvar="WINDOWS_MCP_EXCLUDE_TOOLS",
     type=str,
@@ -607,7 +658,11 @@ def serve(
         install_selfpipe_guard,
     )
 
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # SelectorEventLoop policy gives ProactorEventLoop's subprocess support
+    # away; deprecated in 3.14, removed in 3.16 — guard for forward compat.
+    _sel_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if _sel_policy is not None:
+        asyncio.set_event_loop_policy(_sel_policy())
     install_selfpipe_guard()
     if transport == Transport.STDIO.value:
         os.environ.setdefault("NO_COLOR", "1")
@@ -631,6 +686,11 @@ def serve(
     stateless_http = bool(
         _choose_value(ctx, "stateless_http", stateless_http, cfg.server.stateless_http, False)
     )
+    if stateless_http and transport == Transport.SSE.value:
+        raise click.ClickException(
+            "--stateless-http applies only to streamable-http; the SSE "
+            "transport does not support stateless mode."
+        )
     allow_insecure_remote = bool(
         _choose_value(
             ctx,
@@ -718,7 +778,13 @@ def serve(
         mcp = _build_mcp()
         oauth_store = OAuthStore()
         scheme = "https" if (ssl_certfile and ssl_keyfile) else "http"
-        issuer = f"{scheme}://{host}:{port}"
+        # Wildcard binds aren't a reachable issuer; IPv6 needs brackets.
+        issuer_host = host
+        if issuer_host in ("0.0.0.0", "::", ""):
+            issuer_host = "localhost"
+        elif ":" in issuer_host and not issuer_host.startswith("["):
+            issuer_host = f"[{issuer_host}]"
+        issuer = f"{scheme}://{issuer_host}:{port}"
         routes = build_oauth_routes(
             store=oauth_store,
             issuer=issuer,
@@ -1080,7 +1146,8 @@ def _parse_call_args(pairs: list[str]) -> dict:
     kwargs = {}
     for pair in pairs:
         key, sep, raw = pair.partition("=")
-        if not sep:
+        key = key.strip()
+        if not sep or not key:
             raise click.ClickException(f"--arg must be key=value, got {pair!r}")
         try:
             kwargs[key] = _json.loads(raw)
@@ -1097,7 +1164,8 @@ def _utf8_stdout() -> None:
 
 
 def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
-    """Print a tool result; Image payloads are written to PNG files."""
+    """Print a tool result; image payloads are written to files."""
+    import base64
     import json as _json
 
     _utf8_stdout()
@@ -1106,14 +1174,33 @@ def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
     out = []
     counter = 0
     for item in items:
-        if getattr(item, "data", None) is not None and getattr(item, "mimeType", ""):
+        # fastmcp Image exposes `_mime_type`; mcp.types.ImageContent exposes
+        # `mimeType`. Either may carry `data` (bytes or base64 str) or `path`.
+        mime = getattr(item, "mimeType", None) or getattr(item, "_mime_type", None)
+        data = getattr(item, "data", None)
+        img_path = getattr(item, "path", None)
+        if mime or data is not None or img_path:
             counter += 1
             if save_dir is None:
-                save_dir = os.path.join(os.environ.get("LOCALAPPDATA", "."), "windows-mcp", "cli")
+                save_dir = os.path.join(
+                    os.environ.get("LOCALAPPDATA", "."), "windows-mcp", "cli"
+                )
             os.makedirs(save_dir, exist_ok=True)
-            path = os.path.join(save_dir, f"image_{int(time.time())}_{counter}.png")
-            with open(path, "wb") as f:
-                f.write(item.data)
+            ext = (mime or "image/png").split("/")[-1].replace("jpeg", "jpg")
+            path = os.path.join(save_dir, f"image_{int(time.time())}_{counter}.{ext}")
+            if img_path:
+                import shutil
+
+                shutil.copyfile(img_path, path)
+            elif isinstance(data, str):
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(data))
+            elif isinstance(data, (bytes, bytearray)):
+                with open(path, "wb") as f:
+                    f.write(bytes(data))
+            else:
+                out.append(repr(item))
+                continue
             out.append({"image": path})
         elif hasattr(item, "text"):
             out.append(item.text)

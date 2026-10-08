@@ -86,7 +86,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "App-Tool")
+    @with_analytics(get_analytics, "App-Tool")
     def app_tool(
         mode: Literal["launch", "launch_executable", "resize", "switch"] = "launch",
         name: str | None = None,
@@ -121,6 +121,18 @@ def register(mcp, *, get_desktop, get_analytics):
             result = _launch_executable(executable, args, cwd)
             safety.audit("app.launch_exec", executable)
             return result
+
+        if mode in ("launch", "resize", "switch") and not name:
+            raise ValueError(f"name is required for mode='{mode}'")
+        if mode == "resize":
+            if window_loc is not None and (
+                not isinstance(window_loc, list) or len(window_loc) != 2
+            ):
+                raise ValueError("window_loc must be [x, y]")
+            if window_size is not None and (
+                not isinstance(window_size, list) or len(window_size) != 2
+            ):
+                raise ValueError("window_size must be [width, height]")
 
         if mode == "launch":
             gated = safety.gate(

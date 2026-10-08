@@ -39,7 +39,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Service-Tool")
+    @with_analytics(get_analytics, "Service-Tool")
     def service_tool(
         action: str,
         name: str | None = None,
@@ -97,7 +97,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Task-Tool")
+    @with_analytics(get_analytics, "Task-Tool")
     def task_tool(
         action: str,
         name: str | None = None,
@@ -158,7 +158,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Env-Tool")
+    @with_analytics(get_analytics, "Env-Tool")
     def env_tool(
         action: str,
         name: str | None = None,
@@ -216,7 +216,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "DevMode-Tool")
+    @with_analytics(get_analytics, "DevMode-Tool")
     def devmode_tool(
         action: str,
         name: str | None = None,
@@ -238,14 +238,14 @@ def register(mcp, *, get_desktop, get_analytics):
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
         enabled_b = _as_bool(enabled)
 
-        gated_actions = {"set_developer_mode", "set_feature"}
+        gated_actions = {"set_developer_mode", "set_feature", "set_explorer_pref"}
         if action in gated_actions:
             target = name or "developer_mode"
             gated = safety.gate(
                 f"devmode.{action}:{target}",
                 f"{action} {'enable' if enabled_b else 'disable'} {target}",
                 confirm,
-                dangerous=True,
+                dangerous=action != "set_explorer_pref",
             )
             if gated:
                 return gated

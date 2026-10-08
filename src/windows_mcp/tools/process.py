@@ -21,7 +21,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Process-Tool")
+    @with_analytics(get_analytics, "Process-Tool")
     def process_tool(
         mode: Literal["list", "kill"],
         name: str | None = None,

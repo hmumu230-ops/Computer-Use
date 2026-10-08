@@ -38,7 +38,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Audio-Tool")
+    @with_analytics(get_analytics, "Audio-Tool")
     def audio_tool(
         action: str,
         level: int | None = None,
@@ -79,7 +79,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Display-Tool")
+    @with_analytics(get_analytics, "Display-Tool")
     def display_tool(
         action: str,
         level: int | None = None,
@@ -139,7 +139,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Device-Tool")
+    @with_analytics(get_analytics, "Device-Tool")
     def device_tool(
         action: str,
         device_class: str | None = None,
@@ -199,7 +199,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=True,
         ),
     )
-    @with_analytics(get_analytics(), "Network-Tool")
+    @with_analytics(get_analytics, "Network-Tool")
     def network_tool(
         action: str,
         host: str | None = None,
@@ -224,6 +224,10 @@ def register(mcp, *, get_desktop, get_analytics):
         if action not in valid:
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
         if action == "set_proxy":
+            if _as_bool(enabled) and not server:
+                # ProxyEnable=1 with an empty ProxyServer wedges every
+                # WinHTTP/WinINet client — demand a server when enabling.
+                raise ValueError("server='host:port' required when enabled=true")
             gated = safety.gate(
                 f"network.set_proxy:{safety.digest(server, _as_bool(enabled), bypass)}",
                 f"set system proxy to {server!r} enabled={enabled}",
@@ -238,6 +242,8 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "test":
             if not host:
                 raise ValueError("host required for action='test'")
+            if port is not None and not (0 < int(port) <= 65535):
+                raise ValueError("port must be between 1 and 65535")
             return _fmt(network.test_connection(host, port))
         dispatch = {
             "adapters": network.list_adapters,

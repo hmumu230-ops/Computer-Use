@@ -63,9 +63,15 @@ def _resolve_target(
             )
         x, y = _resolve_label(desktop, label)
         return x, y, f"label {label}", None
+    if label is not None and label < 0:
+        # a negative label would hit interactive_nodes[-1] and silently
+        # resolve to the LAST element — a click on the wrong control
+        raise ValueError(f"label must be >= 0, got {label}")
     if loc is None or len(loc) != 2:
         raise ValueError("Provide ref, label, or loc=[x, y].")
-    return loc[0], loc[1], f"({loc[0]},{loc[1]})", None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in loc):
+        raise ValueError("loc must contain exactly 2 numbers [x, y]")
+    return int(loc[0]), int(loc[1]), f"({loc[0]},{loc[1]})", None
 
 
 def _check_method(method: str) -> str:
@@ -291,7 +297,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Click-Tool")
+    @with_analytics(get_analytics, "Click-Tool")
     def click_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
@@ -305,7 +311,9 @@ def register(
         loc = _as_loc(loc)
         method = _check_method(method)
         x, y, via, locator = _resolve_target(desktop, loc, label, ref)
-        num_clicks = {0: "Hover", 1: "Single", 2: "Double"}
+        if not isinstance(clicks, int) or clicks < 0 or clicks > 5:
+            raise ValueError("clicks must be an integer between 0 and 5")
+        num_clicks = {0: "Hover", 1: "Single", 2: "Double", 3: "Triple"}
 
         if locator is not None and method != "synthetic" and button == "left" and clicks == 1:
             result = actions.activate(locator)
@@ -335,7 +343,8 @@ def register(
 
         desktop.click(loc=[x, y], button=button, clicks=clicks)
         suffix = " (synthetic)" if locator is not None and method == "auto" else ""
-        return f"{num_clicks.get(clicks)} {button} clicked at ({x},{y}) on {via}{suffix}."
+        count = num_clicks.get(clicks, f"{clicks}x")
+        return f"{count} {button} clicked at ({x},{y}) on {via}{suffix}."
 
     @mcp.tool(
         name="Type",
@@ -348,7 +357,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Type-Tool")
+    @with_analytics(get_analytics, "Type-Tool")
     def type_tool(
         text: str,
         loc: list[int] | str | None = None,
@@ -358,12 +367,13 @@ def register(
         caret_position: Literal["start", "idle", "end"] = "idle",
         press_enter: bool | str = False,
         method: Literal["auto", "invoke", "synthetic"] = "auto",
-        raw: bool = False,
+        raw: bool | str = False,
         ctx: Context = None,
     ) -> str:
         desktop = get_desktop()
         loc = _as_loc(loc)
         method = _check_method(method)
+        raw = _as_bool(raw, "raw")
         x, y, via, locator = _resolve_target(desktop, loc, label, ref)
         clear_bool = _as_bool(clear, "clear")
         enter_bool = _as_bool(press_enter, "press_enter")
@@ -422,11 +432,11 @@ def register(
             title="Scroll",
             readOnlyHint=False,
             destructiveHint=False,
-            idempotentHint=True,
+            idempotentHint=False,
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Scroll-Tool")
+    @with_analytics(get_analytics, "Scroll-Tool")
     def scroll_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
@@ -472,7 +482,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Move-Tool")
+    @with_analytics(get_analytics, "Move-Tool")
     def move_tool(
         loc: list[int] | str | None = None,
         label: int | None = None,
@@ -537,8 +547,9 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Shortcut-Tool")
-    def shortcut_tool(shortcut: str, raw: bool = False, ctx: Context = None):
+    @with_analytics(get_analytics, "Shortcut-Tool")
+    def shortcut_tool(shortcut: str, raw: bool | str = False, ctx: Context = None):
+        raw = _as_bool(raw, "raw")
         get_desktop().shortcut(shortcut, raw=raw)
         return f"Pressed {shortcut}{' (scan code)' if raw else ''}."
 
@@ -553,8 +564,10 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Wait-Tool")
+    @with_analytics(get_analytics, "Wait-Tool")
     def wait_tool(duration: int, ctx: Context = None) -> str:
+        if not isinstance(duration, int) or duration < 0 or duration > 3600:
+            raise ValueError("duration must be an integer between 0 and 3600 seconds")
         time.sleep(duration)
         return f"Waited for {duration} seconds."
 
@@ -574,7 +587,7 @@ def register(
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "WaitFor-Tool")
+    @with_analytics(get_analytics, "WaitFor-Tool")
     def wait_for_tool(
         condition: str,
         text: str | None = None,

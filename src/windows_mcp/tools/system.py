@@ -37,7 +37,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "System-Tool")
+    @with_analytics(get_analytics, "System-Tool")
     def system_tool(
         action: str,
         timeout_sec: int = 0,
@@ -106,7 +106,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Window-Tool")
+    @with_analytics(get_analytics, "Window-Tool")
     def window_tool(
         action: str,
         window: str | None = None,
@@ -183,7 +183,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "EventLog-Tool")
+    @with_analytics(get_analytics, "EventLog-Tool")
     def eventlog_tool(
         action: str = "query",
         log_name: str = "Application",
@@ -213,6 +213,6 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Identity-Tool")
+    @with_analytics(get_analytics, "Identity-Tool")
     def identity_tool(ctx: Context = None) -> str:
         return _fmt(identity.whoami())

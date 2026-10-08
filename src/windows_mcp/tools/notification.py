@@ -12,16 +12,16 @@ from windows_mcp import notifications
 def register(mcp, *, get_desktop, get_analytics):
     @mcp.tool(
         name="Notification",
-        description="Sends a Windows toast notification with a title and message.",
+        description="Sends a Windows toast notification with a title and message. app_id is the target app's Application User Model ID; leave the default 'Microsoft.Windows.Explorer' to show it under Windows Explorer.",
         annotations=ToolAnnotations(
             title="Notification",
             readOnlyHint=False,
-            destructiveHint=True,
+            destructiveHint=False,
             idempotentHint=False,
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Notification-Tool")
+    @with_analytics(get_analytics, "Notification-Tool")
     def notification_tool(
         title: Annotated[
             str,
@@ -34,9 +34,9 @@ def register(mcp, *, get_desktop, get_analytics):
         app_id: Annotated[
             str,
             Field(
-                description="The valid Application User Model ID of the toast notification. Required to display the notification in a specific app.",
+                description="Application User Model ID the toast is attributed to (e.g. 'Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'). Default shows it under Windows Explorer.",
             ),
-        ],
+        ] = "Microsoft.Windows.Explorer",
         ctx: Context = None,
     ) -> str:
         try:

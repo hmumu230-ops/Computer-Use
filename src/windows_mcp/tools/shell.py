@@ -19,7 +19,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=True,
         ),
     )
-    @with_analytics(get_analytics(), "Powershell-Tool")
+    @with_analytics(get_analytics, "Powershell-Tool")
     def powershell_tool(
         command: str,
         timeout: int = 30,

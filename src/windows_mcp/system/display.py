@@ -22,7 +22,7 @@ def get_brightness() -> dict[str, Any]:
         }
     try:
         return {"brightness": int(out.strip().splitlines()[-1])}
-    except ValueError, IndexError:
+    except (ValueError, IndexError):
         return {"brightness": None, "raw": out.strip()}
 
 

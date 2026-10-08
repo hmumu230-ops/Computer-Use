@@ -45,7 +45,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "FindText-Tool")
+    @with_analytics(get_analytics, "FindText-Tool")
     def find_text_tool(
         text: str,
         region: list[int] | str | None = None,

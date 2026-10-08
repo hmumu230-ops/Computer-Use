@@ -34,7 +34,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=True,
         ),
     )
-    @with_analytics(get_analytics(), "Scrape-Tool")
+    @with_analytics(get_analytics, "Scrape-Tool")
     async def scrape_tool(
         url: str,
         query: str | None = None,

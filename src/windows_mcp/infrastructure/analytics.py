@@ -154,14 +154,30 @@ class PostHogAnalytics:
             logger.debug("Closed analytics")
 
 
-def with_analytics(analytics_instance: Analytics | None, tool_name: str):
-    """
-    Decorator to wrap tool functions with analytics tracking.
+def with_analytics(
+    analytics_source: "Analytics | Callable[[], Analytics | None] | None",
+    tool_name: str,
+):
+    """Wrap a tool function with analytics tracking.
+
+    ``analytics_source`` may be an Analytics instance, ``None``, or — the
+    preferred form — a zero-arg callable returning the instance. Passing the
+    callable defers lookup to call time: tool registration runs before the
+    server lifespan creates the analytics singleton, so evaluating
+    ``get_analytics()`` at decoration captures None forever and silently
+    disables all tracking.
     """
 
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         @wraps(func)
         async def wrapper(*args, **kwargs) -> T:
+            analytics_instance = (
+                analytics_source
+                if hasattr(analytics_source, "track_tool")
+                else analytics_source()
+                if callable(analytics_source)
+                else analytics_source
+            )
             start = time.time()
 
             # Capture client info from Context passed as argument
