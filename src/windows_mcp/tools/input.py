@@ -318,10 +318,19 @@ def register(
                     f"({locator.control_type} {locator.name!r}). Use method='auto' to allow "
                     "synthetic input fallback."
                 )
-        elif _pattern_required(method) and locator is None:
+        elif _pattern_required(method):
+            # 'invoke' promises no synthetic input — don't silently degrade
+            # when the call shape has no pattern equivalent (right/middle
+            # button, multi-click) or there's no element to invoke at all.
+            if locator is None:
+                raise ValueError(
+                    "method='invoke' requires ref or label targeting a UIA element; "
+                    "raw loc has no element to invoke."
+                )
             raise ValueError(
-                "method='invoke' requires ref or label targeting a UIA element; "
-                "raw loc has no element to invoke."
+                f"method='invoke' cannot express button={button!r} clicks={clicks} "
+                "(patterns only cover a single left activation). "
+                "Use method='auto' or 'synthetic' for this call shape."
             )
 
         desktop.click(loc=[x, y], button=button, clicks=clicks)
@@ -381,10 +390,16 @@ def register(
                     f"({locator.control_type} {locator.name!r}). Use method='auto' to allow "
                     "synthetic typing fallback."
                 )
-        elif _pattern_required(method) and locator is None:
+        elif _pattern_required(method):
+            if locator is None:
+                raise ValueError(
+                    "method='invoke' requires ref or label targeting a UIA element; "
+                    "raw loc has no element."
+                )
             raise ValueError(
-                "method='invoke' requires ref or label targeting a UIA element; "
-                "raw loc has no element."
+                "method='invoke' requires a ValuePattern-compatible call: "
+                "clear=True, press_enter=False, caret_position='idle', raw=False. "
+                "Use method='auto' or 'synthetic' for this call shape."
             )
 
         desktop.type(

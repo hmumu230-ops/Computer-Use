@@ -14,6 +14,7 @@ so an agent can act on an element several times without re-snapshotting.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Iterable
 
 import windows_mcp.uia as uia
@@ -91,13 +92,33 @@ def _runtime_id_of(control: Any) -> tuple[int, ...] | None:
         return None
 
 
+def _control_view_children(node: Any) -> list | None:
+    """Children of `node` in the *control* view (IsControlElement=True).
+
+    index_path values are recorded against a cached control-view traversal;
+    replaying them through `GetChildren()` (raw view) shifts every index
+    whenever a non-control sibling (Text/Image decoration) precedes the
+    target — landing on the wrong element or out of range.
+    """
+    try:
+        cond = uia.CreatePropertyCondition(uia.PropertyId.IsControlElementProperty, True)
+        children = node.FindAll(uia.TreeScope.TreeScope_Children, cond)
+        if children is not None:
+            return list(children)
+    except Exception:
+        pass
+    try:
+        return node.GetChildren()
+    except Exception:
+        return None
+
+
 def _descend_index_path(window: Any, index_path: Iterable[int]) -> Any | None:
     """Walk child indices from the window root. Returns the control or None."""
     node = window
     for index in index_path:
-        try:
-            children = node.GetChildren()
-        except Exception:
+        children = _control_view_children(node)
+        if children is None:
             return None
         if index < 0 or index >= len(children):
             return None
@@ -128,6 +149,10 @@ class RefStore:
         self.latest: dict[int, ElementLocator] = {}
         self.capacity = capacity
         self.generation = 0
+        # FastMCP runs sync tools on a thread pool — every counter/dict
+        # mutation must hold this lock or concurrent Snapshots hand out
+        # duplicate ref numbers and tear `latest` mid-publish.
+        self._lock = threading.Lock()
 
     # -- issuance ---------------------------------------------------------
 
@@ -138,15 +163,17 @@ class RefStore:
         then scrollable). Old locators stay registered — their elements may
         still be alive.
         """
-        self.generation += 1
-        self.latest = {}
-        for flat_index, locator in enumerate(locators):
-            if locator.ref == 0:
-                locator.ref = self._next_ref
-                self._next_ref += 1
-                self._locators[locator.ref] = locator
-            self.latest[flat_index] = locator
-        self._evict()
+        latest: dict[int, ElementLocator] = {}
+        with self._lock:
+            self.generation += 1
+            for flat_index, locator in enumerate(locators):
+                if locator.ref == 0:
+                    locator.ref = self._next_ref
+                    self._next_ref += 1
+                    self._locators[locator.ref] = locator
+                latest[flat_index] = locator
+            self.latest = latest  # atomic publish — no half-filled table
+            self._evict()
 
     def register(self, locator: ElementLocator) -> int:
         """Issue a ref for a locator outside the snapshot flow.
@@ -155,13 +182,15 @@ class RefStore:
         via @eN but never re-resolve (synthetic locators carry only a rect).
         Returns the assigned ref number.
         """
-        locator.ref = self._next_ref
-        self._next_ref += 1
-        self._locators[locator.ref] = locator
-        self._evict()
-        return locator.ref
+        with self._lock:
+            locator.ref = self._next_ref
+            self._next_ref += 1
+            self._locators[locator.ref] = locator
+            self._evict()
+            return locator.ref
 
     def _evict(self) -> None:
+        # caller must hold self._lock
         if len(self._locators) <= self.capacity:
             return
         overflow = len(self._locators) - self.capacity
@@ -191,7 +220,8 @@ class RefStore:
     # -- resolution -------------------------------------------------------
 
     def get(self, ref: int) -> ElementLocator:
-        locator = self._locators.get(ref)
+        with self._lock:
+            locator = self._locators.get(ref)
         if locator is None:
             raise RefError(
                 "UNKNOWN_REF",
@@ -216,7 +246,8 @@ class RefStore:
 
     def resolve_index(self, flat_index: int) -> ElementLocator:
         """Resolve a legacy numeric label to its locator (current snapshot)."""
-        locator = self.latest.get(flat_index)
+        with self._lock:
+            locator = self.latest.get(flat_index)
         if locator is None:
             raise RefError(
                 "ELEMENT_NOT_FOUND",
@@ -230,33 +261,47 @@ class RefStore:
     def _refresh_box(self, locator: ElementLocator) -> None:
         try:
             rect = locator.control.BoundingRectangle
-            box = locator.bounding_box
-            if box is not None and rect is not None:
-                box.left, box.top = rect.left, rect.top
-                box.right, box.bottom = rect.right, rect.bottom
-                box.width, box.height = rect.width(), rect.height()
+            if locator.bounding_box is not None and rect is not None:
+                # publish a fresh object — field-by-field mutation lets
+                # concurrent readers see a torn (new-left, old-width) rect
+                from windows_mcp.tree.views import BoundingBox
+
+                locator.bounding_box = BoundingBox(
+                    left=rect.left,
+                    top=rect.top,
+                    right=rect.right,
+                    bottom=rect.bottom,
+                    width=rect.width(),
+                    height=rect.height(),
+                )
         except Exception:
             pass
 
     def _window_control(self, locator: ElementLocator) -> Any | None:
         handle = locator.window_handle
-        if not handle:
-            return None
-        try:
-            win = uia.ControlFromHandle(handle)
-            if win is not None and _probe_alive(win):
-                return win
-        except Exception:
-            pass
+        if handle:
+            try:
+                win = uia.ControlFromHandle(handle)
+                if win is not None and _probe_alive(win):
+                    # hwnd values are recycled — a live control on a reused
+                    # handle may belong to a different process entirely.
+                    pid = getattr(win, "ProcessId", None)
+                    if not locator.process_id or pid == locator.process_id:
+                        return win
+            except Exception:
+                pass
         # The window handle may have changed (app restart). Fall back to the
-        # owning process and pick the window that contains the element name.
+        # owning process: scan top-level windows for a pid match. (The old
+        # WindowControl(ProcessId=...) path silently dropped ProcessId — it is
+        # not a supported search property — and always missed.)
         if locator.process_id:
             try:
-                win = uia.WindowControl(ProcessId=locator.process_id, searchDepth=1)
-                if win.Exists(maxSearchSeconds=1):
-                    # Exists() can race process exit / pid reuse — verify.
-                    if getattr(win, "ProcessId", None) == locator.process_id:
-                        return win
+                for win in uia.GetRootControl().GetChildren():
+                    try:
+                        if win.ProcessId == locator.process_id:
+                            return win
+                    except Exception:
+                        continue
             except Exception:
                 pass
         return None
@@ -311,9 +356,23 @@ class RefStore:
             candidate = window.FindFirst(uia.TreeScope.TreeScope_Descendants, condition)
         except Exception:
             return None
-        if candidate is not None and _probe_alive(candidate):
-            return candidate
-        return None
+        if candidate is None or not _probe_alive(candidate):
+            return None
+        # FindFirst takes the first match in current tree order; duplicate
+        # AutomationIds (templated rows, toolbars) are common, so cross-check
+        # the recorded name before trusting the hit.
+        if locator.name:
+            try:
+                if (candidate.Name or "") != locator.name:
+                    logger.debug(
+                        "automation-id hit rejected: name %r != recorded %r",
+                        candidate.Name,
+                        locator.name,
+                    )
+                    return None
+            except Exception:
+                return None
+        return candidate
 
     def _scan_runtime_id(self, window: Any, runtime_id: tuple[int, ...]) -> Any | None:
         try:
