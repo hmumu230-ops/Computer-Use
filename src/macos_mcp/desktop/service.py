@@ -242,45 +242,83 @@ class Desktop:
         except Exception:
             return False
 
-    def _ax_search(self, pid: int, role: str, name: str, nth: int):
-        """Re-find an element inside its app by (role, name, nth).
+    def _ax_search(self, er: refs.ElementRef):
+        """Re-find an element inside its app from the stored locator.
 
         Names come from the traversal label ladder (title → description →
         value → placeholder → identifier), so match against all of them.
+        The stored nth picks among same-(role,name) siblings; when we also
+        have a bbox the nearest candidate wins — nth ordering is fragile
+        under re-traversal while geometry is not.
         """
-        try:
-            from macos_mcp.ax.controls import ApplicationControl
+        from macos_mcp.ax.controls import ApplicationControl, _find_recursive_raw
 
-            app = ApplicationControl(pid=pid)
+        try:
+            app = ApplicationControl(pid=er.pid)
         except Exception:
             return None
-        target = (name or "").casefold()
+        target = (er.name or "").casefold()
 
-        def _name_match(ctrl) -> bool:
-            if not target:
-                return True
+        def _names(el) -> list[str]:
+            out = []
             for attr in (
                 ax.Attribute.Title,
                 ax.Attribute.Description,
                 ax.Attribute.Value,
                 ax.Attribute.Identifier,
             ):
-                v = ax.GetAttribute(ctrl.Element, attr)
-                if v is not None and str(v).casefold() == target:
-                    return True
-            return False
+                v = ax.GetAttribute(el, attr)
+                if v is not None:
+                    out.append(str(v).casefold())
+            return out
 
-        try:
-            ctrl = ax.Control(
-                searchFromControl=app,
-                role=role or None,
-                predicate=_name_match,
-                foundIndex=nth + 1,
-                searchInterval=0.2,
+        def _collect(pred):
+            hits: list = []
+            try:
+                _find_recursive_raw(
+                    app.Element, hits, er.role or None, None, None, None,
+                    pred, 25, 0, find_first=False,
+                )
+            except Exception:
+                pass
+            return hits
+
+        if not target:
+            candidates = _collect(lambda el: True)
+        else:
+            candidates = _collect(
+                lambda el: any(v == target for v in _names(el))
             )
-            return ctrl.Element if ctrl.Exists(maxSearchSeconds=1.0) else None
-        except Exception:
+            if len(candidates) <= er.nth:
+                # Exact match found fewer siblings than the nth we stored —
+                # widen to substring (labels drift between traversals).
+                candidates = _collect(
+                    lambda el: any(target in v for v in _names(el))
+                )
+        if not candidates:
             return None
+
+        def _center(el):
+            r = ax.GetRect(el)
+            if not r:
+                return None
+            return (r.center[0], r.center[1])
+
+        if er.bbox:
+            bx = er.bbox.get("x", 0) + er.bbox.get("w", 0) / 2
+            by = er.bbox.get("y", 0) + er.bbox.get("h", 0) / 2
+            diag = max(er.bbox.get("w", 0), er.bbox.get("h", 0), 1)
+            scored = sorted(
+                ((el, c) for el in candidates if (c := _center(el))),
+                key=lambda t: (t[1][0] - bx) ** 2 + (t[1][1] - by) ** 2,
+            )
+            if scored:
+                el, c = scored[0]
+                if ((c[0] - bx) ** 2 + (c[1] - by) ** 2) ** 0.5 <= 3 * diag:
+                    return el
+        if er.nth < len(candidates):
+            return candidates[er.nth]
+        return candidates[-1]
 
     def resolve_element(self, ref: str) -> refs.ElementRef:
         """Resolve @eN → ElementRef with a live (or re-found) element."""
@@ -301,7 +339,11 @@ class Desktop:
             rect = ax.GetRect(er.element)
             if rect:
                 return (int(rect.center[0]), int(rect.center[1]))
-        bb = er.bbox or {}
+        bb = er.bbox
+        if not bb:
+            raise refs.StaleRef(
+                f"{ref} resolved to no geometry",
+                hint="element lost its rect; take a fresh Snapshot")
         return (int(bb.get("x", 0) + bb.get("w", 0) // 2),
                 int(bb.get("y", 0) + bb.get("h", 0) // 2))
 
@@ -316,10 +358,23 @@ class Desktop:
             from macos_mcp.ax.controls import ApplicationControl
 
             app = ApplicationControl(pid=wr.pid)
+            want = (wr.title or "").casefold()
+            main = None
             for w in app.Windows or []:
-                if (w.Name or "") == wr.title:
-                    wr.element = w.Element
-                    return wr
+                if (w.Name or "").casefold() == want:
+                    main = w
+                    break
+            # App name was stored when the window had no title of its own —
+            # any live window beats a dead ref, so fall back to MainWindow.
+            if main is None:
+                main = app.MainWindow
+            if main is not None:
+                wr.element = main.Element
+                r = ax.GetRect(wr.element)
+                if r:
+                    wr.geometry = {"x": int(r.left), "y": int(r.top),
+                                   "w": int(r.width), "h": int(r.height)}
+                return wr
         except Exception:
             pass
         raise refs.StaleRef(
@@ -378,9 +433,11 @@ class Desktop:
                 ax.SetAttribute(el, ax.Attribute.Focused, True)
                 time.sleep(0.05)
             if ax.IsAttributeSettable(el, ax.Attribute.Value):
-                if clear:
-                    ax.SetAttribute(el, ax.Attribute.Value, "")
-                ax.SetAttribute(el, ax.Attribute.Value, text)
+                value = text
+                if not clear:
+                    current = ax.GetAttribute(el, ax.Attribute.Value) or ""
+                    value = str(current) + text
+                ax.SetAttribute(el, ax.Attribute.Value, value)
                 if press_enter:
                     ax.KeyPress(ax.KeyCode.Return)
                 return f"set AXValue on {ref}"
@@ -442,10 +499,24 @@ class Desktop:
         out = []
         for el in hits[:limit]:
             r = ax.GetRect(el)
+            # Resolve the label the same ladder the tree uses — storing the
+            # search query as the name breaks re-resolution when the query
+            # was a substring or empty.
+            label = ""
+            for attr in (
+                ax.Attribute.Title,
+                ax.Attribute.Description,
+                ax.Attribute.Value,
+                ax.Attribute.Identifier,
+            ):
+                v = ax.GetAttribute(el, attr)
+                if v is not None and str(v).strip():
+                    label = str(v)
+                    break
             er = refs.STORE.add_element(
                 element=el, pid=pid,
                 role=ax.GetAttribute(el, ax.Attribute.Role) or "",
-                name=name or str(ax.GetAttribute(el, ax.Attribute.Title) or ""),
+                name=label or name,
                 bbox=({"x": int(r.left), "y": int(r.top),
                        "w": int(r.width), "h": int(r.height)} if r else None),
             )
@@ -529,8 +600,8 @@ class Desktop:
                     return hits[0]
             except refs.StaleRef:
                 pass  # dead ref — keep polling; it may resolve again
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("wait_for poll error (retrying): %r", exc)
             if time.time() >= deadline:
                 raise refs.CuError(
                     f"wait_for timed out after {timeout}s",
@@ -709,6 +780,7 @@ class Desktop:
                 status = Status.WINDOWLESS
 
             empty = BoundingBox(left=0, top=0, right=0, bottom=0, width=0, height=0)
+            main_window = None
             # Get bounding box from the main window (if any)
             if status in (Status.HIDDEN, Status.MINIMIZED, Status.WINDOWLESS):
                 bbox = empty
@@ -736,6 +808,8 @@ class Desktop:
                 pid=pid,
                 bundle_id=bundle_id,
                 dialog=_dialog_view(dialog) if dialog else None,
+                element=main_window.Element if main_window else None,
+                window_title=(main_window.Name or "") if main_window else "",
             )
 
         def _describe_pooled(app) -> Optional[Window]:
@@ -759,9 +833,9 @@ class Desktop:
         # Register @wN refs serially — RefStore counters are not thread-safe.
         for w in out:
             wr = refs.STORE.add_window(
-                element=None,
+                element=w.element,
                 pid=w.pid,
-                title=w.name,
+                title=w.window_title or w.name,
                 geometry={"x": w.bounding_box.left, "y": w.bounding_box.top,
                           "w": w.bounding_box.width, "h": w.bounding_box.height},
             )
@@ -881,7 +955,7 @@ class Desktop:
 
         seen_boxes: set[tuple[int, int, int, int]] = set()
 
-        def draw_annotation(label: int, node: TreeElementNode) -> None:
+        def draw_annotation(label: str, node: TreeElementNode) -> None:
             box = node.bounding_box
             if box.width <= 0 or box.height <= 0:
                 return
@@ -912,7 +986,7 @@ class Desktop:
                 y2 += padding
 
             # Deterministic color per label
-            random.seed(label)
+            random.seed(label)  # stable across draws for the same ref
             color = (
                 random.randint(50, 255),
                 random.randint(50, 255),
@@ -942,7 +1016,10 @@ class Desktop:
             )
 
         for i, node in enumerate(nodes):
-            draw_annotation(i, node)
+            # Draw the @eN the agent must pass — the tree table and the
+            # annotated screenshot then agree on the same identifier.
+            ref = (node.metadata or {}).get("ref", "")
+            draw_annotation(ref.lstrip("@") or str(i), node)
 
         if scale < 1.0 and scale > 0:
             new_w = max(1, int(padded.width * scale))

@@ -64,7 +64,7 @@ class TestResolve:
         er = store.resolve_element(
             "@e1",
             probe=lambda e: False,
-            search=lambda pid, role, name, nth: found,
+            search=lambda locator: found,
         )
         assert er.element is found
 

@@ -29,10 +29,11 @@ class TreeState:
             return "\n".join(parts)
         # TOON-like format: Pipe-separated values with clear header
         # Using abbreviations in header to save tokens
-        header = "# id|window|control_type|name|coords|metadata"
+        header = "# ref|window|control_type|name|coords|metadata"
         rows = [header]
         for idx, node in enumerate(self.interactive_nodes):
-            row = f"{idx}|{node.window_name}|{node.control_type}|{node.name}|{node.center.to_string()}|{json.dumps(node.metadata)}"
+            ref = (node.metadata or {}).get("ref", str(idx))
+            row = f"{ref}|{node.window_name}|{node.control_type}|{node.name}|{node.center.to_string()}|{json.dumps(node.metadata)}"
             rows.append(row)
         parts.append("\n".join(rows))
         return "\n".join(parts)
@@ -46,12 +47,13 @@ class TreeState:
             parts.append(EMPTY_MESSAGE)
             return "\n".join(parts)
         # TOON-like format
-        header = "# id|window|control_type|name|coords|metadata"
+        header = "# ref|window|control_type|name|coords|metadata"
         rows = [header]
         base_index = len(self.interactive_nodes)
         for idx, node in enumerate(self.scrollable_nodes):
+            ref = (node.metadata or {}).get("ref", str(base_index + idx))
             row = (
-                f"{base_index + idx}|{node.window_name}|{node.control_type}|{node.name}|"
+                f"{ref}|{node.window_name}|{node.control_type}|{node.name}|"
                 f"{node.center.to_string()}|{json.dumps(node.metadata)}"
             )
             rows.append(row)

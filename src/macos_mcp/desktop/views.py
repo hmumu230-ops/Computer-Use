@@ -1,6 +1,6 @@
 from macos_mcp.tree.views import BoundingBox
 from macos_mcp.tree.views import TreeState
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from PIL.Image import Image
 from typing import Union
 from enum import Enum
@@ -52,6 +52,10 @@ class Window:
     bundle_id: str
     dialog: Dialog | None = None
     ref: str = ""
+    # Opaque live AX window element + its real AXTitle, used to mint @wN
+    # refs that can re-resolve after the ref generation survives.
+    element: object = field(default=None, repr=False, compare=False)
+    window_title: str = ""
 
     def to_string(self) -> str:
         line = f"{self.ref + ' ' if self.ref else ''}{self.name} ({self.bundle_id}) - {self.status.value}"

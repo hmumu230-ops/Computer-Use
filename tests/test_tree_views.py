@@ -243,7 +243,7 @@ class TestTreeState:
         )
         state = TreeState(interactive_nodes=[node])
         result = state.interactive_elements_to_string()
-        assert "# id|window|control_type|name|coords|metadata" in result
+        assert "# ref|window|control_type|name|coords|metadata" in result
         assert "0|Test Window|Button|Click Me|(100,200)|" in result
         assert '"enabled": true' in result
 
@@ -297,7 +297,7 @@ class TestTreeState:
         )
         state = TreeState(interactive_nodes=[], scrollable_nodes=[scroll_node])
         result = state.scrollable_elements_to_string()
-        assert "# id|window|control_type|name|coords|metadata" in result
+        assert "# ref|window|control_type|name|coords|metadata" in result
         assert "0|Main Window|ScrollArea|Scroll Area|(400,500)|" in result
 
     def test_scrollable_elements_to_string_with_interactive_base_index(self):
