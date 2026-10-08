@@ -8,7 +8,7 @@ import json
 
 from mcp.types import ToolAnnotations
 from windows_mcp.infrastructure import with_analytics
-from windows_mcp.ocr import OcrError, find, ocr_image
+from windows_mcp.ocr import find, ocr_image
 from windows_mcp.refs.locator import ElementLocator
 from windows_mcp.tree.views import BoundingBox
 from fastmcp import Context
@@ -17,9 +17,13 @@ _MAX_MATCHES = 20
 
 
 def _as_region(value: list | str | None) -> list | None:
-    if value is None or isinstance(value, list):
-        return value
-    return json.loads(value)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("region must be a [left, top, right, bottom] list")
+    return list(value)
 
 
 def register(mcp, *, get_desktop, get_analytics):
@@ -57,18 +61,22 @@ def register(mcp, *, get_desktop, get_analytics):
         all_matches = all is True or (isinstance(all, str) and all.lower() == "true")
 
         capture_rect = None
-        offset = (0, 0)
         if region is not None:
             if len(region) != 4:
                 raise ValueError("region must be [left, top, right, bottom]")
             capture_rect = desktop.parse_region_selection(region)
             offset = (capture_rect.left, capture_rect.top)
+        else:
+            # Full-capture backends grab the whole *virtual* screen whose
+            # origin (SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN) is negative when a
+            # monitor sits left/above the primary — without this offset every
+            # @eN ref and reported coordinate is off by one monitor's width.
+            from windows_mcp import uia
 
-        try:
-            image = desktop.get_screenshot(capture_rect)
-            words = ocr_image(image, offset=offset)
-        except OcrError:
-            raise
+            offset = uia.GetVirtualScreenRect()[:2]
+
+        image = desktop.get_screenshot(capture_rect)
+        words = ocr_image(image, offset=offset)
 
         matches = find(words, text, exact=exact)
         if not matches:
