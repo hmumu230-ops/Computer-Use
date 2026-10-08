@@ -935,11 +935,15 @@ def _register_task_powershell(task_name: str, script_path: str) -> subprocess.Co
     Unlike `schtasks /Create /SC ONLOGON`, Register-ScheduledTask with
     -RunLevel Limited does not require an elevated shell.
     """
+    # Single-quote escape inside PS single-quoted strings (' → '') —
+    # a username like O'Brien in the profile path would break the command.
+    safe_script = script_path.replace("'", "''")
+    safe_task = task_name.replace("'", "''")
     ps = (
-        f"$action  = New-ScheduledTaskAction -Execute '{script_path}';"
+        f"$action  = New-ScheduledTaskAction -Execute '{safe_script}';"
         f"$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
         f"$set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
-        f"Register-ScheduledTask -TaskName '{task_name}' -Action $action"
+        f"Register-ScheduledTask -TaskName '{safe_task}' -Action $action"
         f" -Trigger $trigger -Settings $set -RunLevel Limited -Force"
     )
     return subprocess.run(
@@ -970,6 +974,34 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
 
     _config_dir().mkdir(parents=True, exist_ok=True)
 
+    # An installed service that authenticates nothing lets any local process
+    # drive the desktop. If there's no config yet, mint an auth key into a
+    # fresh config.toml so `serve` starts with a bearer requirement. An
+    # existing config is left untouched.
+    config_file = _config_dir() / "config.toml"
+    generated_key = None
+    if not config_file.exists():
+        cfg = WindowsMCPConfig()
+        generated_key = secrets.token_urlsafe(32)
+        cfg.server.auth_key = generated_key
+        cfg.server.transport = transport
+        cfg.server.host = host
+        cfg.server.port = port
+        write_config(cfg, config_file)
+    else:
+        try:
+            cfg_existing = load_config(config_file)
+        except (FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(str(exc))
+        from windows_mcp.infrastructure import is_loopback_host
+
+        if not cfg_existing.server.auth_key and not is_loopback_host(host):
+            raise click.ClickException(
+                f"install --host {host} would start an unauthenticated remote "
+                "server every login (serve would refuse and the task would "
+                "die). Set server.auth_key in config.toml or use a loopback host."
+            )
+
     exe = _resolve_program()
     args = exe + ["serve", "--transport", transport, "--host", host, "--port", str(port)]
     _start_script_path().write_text(_build_start_script(args), encoding="utf-8")
@@ -994,6 +1026,8 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
     click.echo(f"  Transport : {transport}")
     click.echo(f"  Address   : {host}:{port}")
     click.echo(f"  Logs      : {_config_dir() / 'server.log'}")
+    if generated_key:
+        click.echo(f"  Auth key  : {generated_key}  (written to {config_file})")
     click.echo("\nThe server will restart automatically at every login.")
     click.echo("Run `windows-mcp uninstall` to remove it.")
 
