@@ -3,6 +3,7 @@
 from typing import Literal
 
 from mcp.types import ToolAnnotations
+from windows_mcp import safety
 from windows_mcp.infrastructure import with_analytics
 from windows_mcp import registry
 from windows_mcp.registry import RegistryType
@@ -28,9 +29,19 @@ def register(mcp, *, get_desktop, get_analytics):
         name: str | None = None,
         value: str | None = None,
         type: RegistryType = 'String',
+        confirm: str | None = None,
         ctx: Context = None,
     ) -> str:
         try:
+            if mode in ('set', 'delete'):
+                gated = safety.gate(
+                    f"registry.{mode}:{safety.digest(path, name, value, str(type))}",
+                    f"registry {mode} {path} name={name or '(key)'}",
+                    confirm,
+                    dangerous=True,
+                )
+                if gated:
+                    return gated
             if mode == 'get':
                 if name is None:
                     return 'Error: name parameter is required for get mode.'
@@ -40,12 +51,16 @@ def register(mcp, *, get_desktop, get_analytics):
                     return 'Error: name parameter is required for set mode.'
                 if value is None:
                     return 'Error: value parameter is required for set mode.'
-                return registry.set_value(path=path, name=name, value=value, reg_type=type)
+                result = registry.set_value(path=path, name=name, value=value, reg_type=type)
+                safety.audit("registry.set", f"{path} {name}")
+                return result
             elif mode == 'delete':
-                return registry.delete_entry(path=path, name=name)
+                result = registry.delete_entry(path=path, name=name)
+                safety.audit("registry.delete", f"{path} {name or '(key)'}")
+                return result
             elif mode == 'list':
                 return registry.list_key(path=path)
             else:
                 return 'Error: mode must be "get", "set", "delete", or "list".'
-        except Exception as e:
+        except Exception:
             raise

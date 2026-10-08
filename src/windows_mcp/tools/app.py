@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from mcp.types import ToolAnnotations
+from windows_mcp import safety
 from windows_mcp.infrastructure import with_analytics
 from fastmcp import Context
 
@@ -94,6 +95,7 @@ def register(mcp, *, get_desktop, get_analytics):
         executable: str | None = None,
         args: list[str] | str | None = None,
         cwd: str | None = None,
+        confirm: str | None = None,
         ctx: Context = None,
     ):
         exact_launch_inputs = (executable, args, cwd)
@@ -108,6 +110,23 @@ def register(mcp, *, get_desktop, get_analytics):
                     "name, window_loc, and window_size are not supported for "
                     'mode="launch_executable"'
                 )
-            return _launch_executable(executable, args, cwd)
+            gated = safety.gate(
+                f"app.launch_exec:{safety.digest(executable, json.dumps(args) if args else '', cwd)}",
+                f"launch executable '{executable}'",
+                confirm,
+                dangerous=True,
+            )
+            if gated:
+                return gated
+            result = _launch_executable(executable, args, cwd)
+            safety.audit("app.launch_exec", executable)
+            return result
+
+        if mode == "launch":
+            gated = safety.gate(
+                f"app.launch:{name}", f"launch app '{name}'", confirm, dangerous=False
+            )
+            if gated:
+                return gated
 
         return get_desktop().app(mode, name, window_loc, window_size)

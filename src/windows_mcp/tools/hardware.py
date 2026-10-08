@@ -108,6 +108,15 @@ def register(mcp, *, get_desktop, get_analytics):
             result = display.set_resolution(device_name, width, height, hz)
             safety.audit("display.set_resolution", str(result))
             return _fmt(result)
+        if action == "set_brightness":
+            gated = safety.gate(
+                f"display.set_brightness:{level}",
+                f"set display brightness to {level}",
+                confirm,
+                dangerous=False,
+            )
+            if gated:
+                return gated
         dispatch = {
             "brightness": display.get_brightness,
             "set_brightness": lambda: display.set_brightness(level if level is not None else 50),
@@ -161,6 +170,14 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "set_default_printer":
             if not name:
                 raise ValueError("name required for set_default_printer")
+            gated = safety.gate(
+                f"device.set_default_printer:{name}",
+                f"set default printer to {name}",
+                confirm,
+                dangerous=False,
+            )
+            if gated:
+                return gated
             return _fmt(device.set_default_printer(name))
         if action == "printers":
             return _fmt(device.list_printers())
@@ -208,7 +225,7 @@ def register(mcp, *, get_desktop, get_analytics):
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
         if action == "set_proxy":
             gated = safety.gate(
-                f"network.proxy:{server}",
+                f"network.set_proxy:{safety.digest(server, _as_bool(enabled), bypass)}",
                 f"set system proxy to {server!r} enabled={enabled}",
                 confirm,
                 dangerous=True,

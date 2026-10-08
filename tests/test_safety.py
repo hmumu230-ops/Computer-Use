@@ -79,3 +79,76 @@ def test_audit_log_written(tmp_path):
     assert log.exists()
     assert '"event": "blocked"' in log.read_text()
     assert "system.shutdown" in log.read_text()
+
+
+# ---------------------------------------------------------------------------
+# command_dangerous — PowerShell payload classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "Get-ChildItem",
+        "Get-Process | Where-Object {$_.CPU -gt 10}",
+        "ls C:\\Users; pwd",
+        "Get-Content file.txt | Select-String error",
+        "whoami; hostname; systeminfo",
+        "Get-ChildItem | Format-Table",
+        "ipconfig /all",
+        "ping 8.8.8.8",
+        "Test-Path C:\\x",
+        "cat file.txt",
+        "echo hello",
+        "$env:PATH",
+        "Get-Service | ConvertTo-Json",
+    ],
+)
+def test_readonly_commands_not_dangerous(command):
+    assert safety.command_dangerous(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "Stop-Service Spooler",
+        "Remove-Item C:\\x -Recurse",
+        "rm -rf C:\\x",
+        "del file.txt",
+        "mkdir foo",
+        "New-Item foo.txt",
+        "Set-Content f.txt x",
+        "Get-ChildItem; Remove-Item C:\\x",  # readonly first stage hides mutating second
+        "echo x > out.txt",  # redirection
+        "ls | Out-File list.txt",  # Out-File writes
+        "shutdown /s /t 0",
+        "taskkill /f /im notepad.exe",
+        "reg add HKCU\\Software\\X",
+        "Set-ExecutionPolicy Bypass",
+        "Invoke-Expression 'rm -rf /'",
+        "iwr http://x -OutFile y",
+        "python script.py",
+        "net user admin pass /add",
+        "Copy-Item a b",
+        "Move-Item a b",
+        "netsh advfirewall set allprofiles state off",
+        "icacls C:\\ /grant everyone:F",
+        "Start-Process notepad",
+        "Set-Service Spooler -StartupType Disabled",
+        "Get-ChildItem | Format-Volume",  # format-table is readonly, format-volume is not
+    ],
+)
+def test_mutating_commands_dangerous(command):
+    assert safety.command_dangerous(command) is True
+
+
+def test_empty_command_not_dangerous():
+    assert safety.command_dangerous("") is False
+
+
+def test_digest_binds_all_params():
+    a = safety.digest("notepad.exe", "")
+    b = safety.digest("malware.exe", "")
+    c = safety.digest("notepad.exe", "/flag")
+    assert a != b and a != c and b != c
+    assert safety.digest("x", None) == safety.digest("x", None)
