@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from mcp.types import ToolAnnotations
+from windows_mcp import safety
 from windows_mcp.infrastructure import with_analytics
 from fastmcp import Context
 
@@ -85,7 +86,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "App-Tool")
+    @with_analytics(get_analytics, "App-Tool")
     def app_tool(
         mode: Literal["launch", "launch_executable", "resize", "switch"] = "launch",
         name: str | None = None,
@@ -94,6 +95,7 @@ def register(mcp, *, get_desktop, get_analytics):
         executable: str | None = None,
         args: list[str] | str | None = None,
         cwd: str | None = None,
+        confirm: str | None = None,
         ctx: Context = None,
     ):
         exact_launch_inputs = (executable, args, cwd)
@@ -108,6 +110,35 @@ def register(mcp, *, get_desktop, get_analytics):
                     "name, window_loc, and window_size are not supported for "
                     'mode="launch_executable"'
                 )
-            return _launch_executable(executable, args, cwd)
+            gated = safety.gate(
+                f"app.launch_exec:{safety.digest(executable, json.dumps(args) if args else '', cwd)}",
+                f"launch executable '{executable}'",
+                confirm,
+                dangerous=True,
+            )
+            if gated:
+                return gated
+            result = _launch_executable(executable, args, cwd)
+            safety.audit("app.launch_exec", executable)
+            return result
+
+        if mode in ("launch", "resize", "switch") and not name:
+            raise ValueError(f"name is required for mode='{mode}'")
+        if mode == "resize":
+            if window_loc is not None and (
+                not isinstance(window_loc, list) or len(window_loc) != 2
+            ):
+                raise ValueError("window_loc must be [x, y]")
+            if window_size is not None and (
+                not isinstance(window_size, list) or len(window_size) != 2
+            ):
+                raise ValueError("window_size must be [width, height]")
+
+        if mode == "launch":
+            gated = safety.gate(
+                f"app.launch:{name}", f"launch app '{name}'", confirm, dangerous=False
+            )
+            if gated:
+                return gated
 
         return get_desktop().app(mode, name, window_loc, window_size)

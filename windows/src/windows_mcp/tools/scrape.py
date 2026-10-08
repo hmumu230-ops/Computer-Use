@@ -1,8 +1,25 @@
 """Scrape tool — fetch/scrape web page content."""
 
+import asyncio
+
 from mcp.types import ToolAnnotations
 from windows_mcp.infrastructure import with_analytics
 from fastmcp import Context
+
+
+def _dom_content(desktop) -> str | None:
+    """Blocking UIA tree walk — runs in a worker thread via to_thread."""
+    desktop_state = desktop.get_state(use_vision=False, use_dom=True)
+    tree_state = desktop_state.tree_state
+    if not tree_state.dom_node:
+        return None
+    vertical_scroll_percent = getattr(tree_state.dom_node, "vertical_scroll_percent", 0)
+    content = "\n".join(node.text for node in tree_state.dom_informative_nodes)
+    header = "Reached top" if vertical_scroll_percent <= 0 else "Scroll up to see more"
+    footer = (
+        "Reached bottom" if vertical_scroll_percent >= 100 else "Scroll down to see more"
+    )
+    return f"{header}\n{content}\n{footer}"
 
 
 def register(mcp, *, get_desktop, get_analytics):
@@ -17,7 +34,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=True,
         ),
     )
-    @with_analytics(get_analytics(), "Scrape-Tool")
+    @with_analytics(get_analytics, "Scrape-Tool")
     async def scrape_tool(
         url: str,
         query: str | None = None,
@@ -30,20 +47,12 @@ def register(mcp, *, get_desktop, get_analytics):
         use_sampling = use_sampling is True or (isinstance(use_sampling, str) and use_sampling.lower() == "true")
 
         if not use_dom:
-            content = desktop.scrape(url)
+            # requests-based fetch blocks — keep it off the event loop
+            content = await asyncio.to_thread(desktop.scrape, url)
         else:
-            desktop_state = desktop.get_state(use_vision=False, use_dom=True)
-            tree_state = desktop_state.tree_state
-            if not tree_state.dom_node:
+            content = await asyncio.to_thread(_dom_content, desktop)
+            if content is None:
                 return f"No DOM information found. Please open {url} in browser first."
-            dom_node = tree_state.dom_node
-            vertical_scroll_percent = getattr(dom_node, 'vertical_scroll_percent', 0)
-            content = "\n".join([node.text for node in tree_state.dom_informative_nodes])
-            header_status = "Reached top" if vertical_scroll_percent <= 0 else "Scroll up to see more"
-            footer_status = (
-                "Reached bottom" if vertical_scroll_percent >= 100 else "Scroll down to see more"
-            )
-            content = f"{header_status}\n{content}\n{footer_status}"
 
         if use_sampling and ctx is not None:
             try:

@@ -1,5 +1,6 @@
 """Snapshot and Screenshot tools — desktop state capture."""
 
+import json
 import logging
 
 from mcp.types import ToolAnnotations
@@ -24,7 +25,7 @@ def register(mcp, *, get_desktop, get_analytics):
     global state_tool, screenshot_tool
     @mcp.tool(
         name='Snapshot',
-        description="Take a screenshot and inspect the screen. Keywords: screenshot, screen capture, see screen, observe, look, inspect, UI elements, what's on screen. Captures complete desktop state including: system language, focused/opened windows, interactive elements (buttons, text fields, links, menus with coordinates), and scrollable areas. Set use_vision=True to include screenshot with cursor highlight. Set use_annotation=False to get a clean screenshot without bounding box overlays on UI elements (default: True, draws colored rectangles around detected elements). Set use_ui_tree=False for a faster screenshot-only snapshot when you do not need interactive or scrollable element extraction. Set width_reference_lines/height_reference_lines to overlay a grid for better spatial reasoning (make sure vision is enabled to use it). Set use_dom=True for browser content to get web page elements instead of browser UI. Set display=[0] or display=[0,1] using zero-based active Windows display indices; omit it to keep the default full-desktop behavior. Set region=[left, top, right, bottom] in virtual-desktop pixel coordinates to capture and inspect only that rectangle instead of the whole screen/display — useful when you already know which area matters and want to save tokens; region takes precedence over display when both are given, and an invalid or out-of-bounds region raises an error rather than silently capturing something else. Always call this first to understand the current desktop state before taking actions.",
+        description="Take a screenshot and inspect the screen. Keywords: screenshot, screen capture, see screen, observe, look, inspect, UI elements, what's on screen. Captures complete desktop state including: focused/opened windows, interactive elements (buttons, text fields, links, menus with coordinates), and scrollable areas. Set use_vision=True to include screenshot with cursor highlight. Set use_annotation=False to get a clean screenshot without bounding box overlays on UI elements (default: True, draws colored rectangles around detected elements). Set use_ui_tree=False for a faster screenshot-only snapshot when you do not need interactive or scrollable element extraction. Set width_reference_line/height_reference_line to overlay a grid for better spatial reasoning (make sure vision is enabled to use it). Set use_dom=True for browser content to get web page elements instead of browser UI. Set display=[0] or display=[0,1] using zero-based active Windows display indices; omit it to keep the default full-desktop behavior. Set region=[left, top, right, bottom] in virtual-desktop pixel coordinates to capture and inspect only that rectangle instead of the whole screen/display — useful when you already know which area matters and want to save tokens; region takes precedence over display when both are given, and an invalid or out-of-bounds region raises an error rather than silently capturing something else. Always call this first to understand the current desktop state before taking actions.",
         annotations=ToolAnnotations(
             title="Snapshot",
             readOnlyHint=True,
@@ -33,7 +34,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "State-Tool")
+    @with_analytics(get_analytics, "State-Tool")
     def _state_tool(
         use_vision: bool | str = False,
         use_dom: bool | str = False,
@@ -41,11 +42,13 @@ def register(mcp, *, get_desktop, get_analytics):
         use_ui_tree: bool | str = True,
         width_reference_line: int | None = None,
         height_reference_line: int | None = None,
-        display: list[int] | None = None,
+        display: list[int] | str | None = None,
         region: list[int] | str | None = None,
         ctx: Context = None,
     ):
         try:
+            if isinstance(display, str):
+                display = json.loads(display)
             capture_result = capture_desktop_state(
                 get_desktop(),
                 use_vision=_as_bool(use_vision),
@@ -82,16 +85,18 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Screenshot-Tool")
+    @with_analytics(get_analytics, "Screenshot-Tool")
     def _screenshot_tool(
         use_annotation: bool | str = False,
         width_reference_line: int | None = None,
         height_reference_line: int | None = None,
-        display: list[int] | None = None,
+        display: list[int] | str | None = None,
         region: list[int] | str | None = None,
         ctx: Context = None,
     ):
         try:
+            if isinstance(display, str):
+                display = json.loads(display)
             capture_result = capture_desktop_state(
                 get_desktop(),
                 use_vision=True,

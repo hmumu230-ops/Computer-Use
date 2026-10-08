@@ -17,7 +17,7 @@ def _ps(cmd: str, timeout: int = 30) -> tuple[Any, int]:
         return out.strip(), rc
     try:
         return json.loads(out), 0
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return out.strip(), rc
 
 

@@ -38,7 +38,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Audio-Tool")
+    @with_analytics(get_analytics, "Audio-Tool")
     def audio_tool(
         action: str,
         level: int | None = None,
@@ -79,7 +79,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Display-Tool")
+    @with_analytics(get_analytics, "Display-Tool")
     def display_tool(
         action: str,
         level: int | None = None,
@@ -108,6 +108,15 @@ def register(mcp, *, get_desktop, get_analytics):
             result = display.set_resolution(device_name, width, height, hz)
             safety.audit("display.set_resolution", str(result))
             return _fmt(result)
+        if action == "set_brightness":
+            gated = safety.gate(
+                f"display.set_brightness:{level}",
+                f"set display brightness to {level}",
+                confirm,
+                dangerous=False,
+            )
+            if gated:
+                return gated
         dispatch = {
             "brightness": display.get_brightness,
             "set_brightness": lambda: display.set_brightness(level if level is not None else 50),
@@ -130,7 +139,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Device-Tool")
+    @with_analytics(get_analytics, "Device-Tool")
     def device_tool(
         action: str,
         device_class: str | None = None,
@@ -161,6 +170,14 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "set_default_printer":
             if not name:
                 raise ValueError("name required for set_default_printer")
+            gated = safety.gate(
+                f"device.set_default_printer:{name}",
+                f"set default printer to {name}",
+                confirm,
+                dangerous=False,
+            )
+            if gated:
+                return gated
             return _fmt(device.set_default_printer(name))
         if action == "printers":
             return _fmt(device.list_printers())
@@ -182,7 +199,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=True,
         ),
     )
-    @with_analytics(get_analytics(), "Network-Tool")
+    @with_analytics(get_analytics, "Network-Tool")
     def network_tool(
         action: str,
         host: str | None = None,
@@ -207,8 +224,12 @@ def register(mcp, *, get_desktop, get_analytics):
         if action not in valid:
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
         if action == "set_proxy":
+            if _as_bool(enabled) and not server:
+                # ProxyEnable=1 with an empty ProxyServer wedges every
+                # WinHTTP/WinINet client — demand a server when enabling.
+                raise ValueError("server='host:port' required when enabled=true")
             gated = safety.gate(
-                f"network.proxy:{server}",
+                f"network.set_proxy:{safety.digest(server, _as_bool(enabled), bypass)}",
                 f"set system proxy to {server!r} enabled={enabled}",
                 confirm,
                 dangerous=True,
@@ -221,6 +242,8 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "test":
             if not host:
                 raise ValueError("host required for action='test'")
+            if port is not None and not (0 < int(port) <= 65535):
+                raise ValueError("port must be between 1 and 65535")
             return _fmt(network.test_connection(host, port))
         dispatch = {
             "adapters": network.list_adapters,

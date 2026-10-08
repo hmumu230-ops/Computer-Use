@@ -35,7 +35,7 @@ def query(
         return out.strip(), rc
     try:
         return json.loads(out), 0
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return out.strip(), rc
 
 
@@ -50,5 +50,5 @@ def list_logs() -> tuple[Any, int]:
         return out.strip(), rc
     try:
         return json.loads(out), 0
-    except json.JSONDecodeError, ValueError:
+    except (json.JSONDecodeError, ValueError):
         return out.strip(), rc

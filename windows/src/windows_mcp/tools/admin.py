@@ -39,7 +39,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Service-Tool")
+    @with_analytics(get_analytics, "Service-Tool")
     def service_tool(
         action: str,
         name: str | None = None,
@@ -57,12 +57,13 @@ def register(mcp, *, get_desktop, get_analytics):
             raise ValueError(f"name required for action='{action}'")
 
         key = f"service.{action}:{name}"
-        if action in ("stop", "startup_type"):
-            desc = (
-                f"stop service {name}"
-                if action == "stop"
-                else f"set service {name} startup to {startup_type}"
-            )
+        if action in ("start", "stop", "restart", "startup_type"):
+            desc = {
+                "start": f"start service {name}",
+                "stop": f"stop service {name}",
+                "restart": f"restart service {name}",
+                "startup_type": f"set service {name} startup to {startup_type}",
+            }[action]
             gated = safety.gate(key, desc, confirm, dangerous=True)
             if gated:
                 return gated
@@ -76,7 +77,7 @@ def register(mcp, *, get_desktop, get_analytics):
             "startup_type": lambda: service.set_startup_type(name, startup_type or "Manual"),
         }
         result = dispatch[action]()
-        if action in ("stop", "startup_type"):
+        if action in ("start", "stop", "restart", "startup_type"):
             safety.audit(key, str(result)[:200])
         return _fmt(result)
 
@@ -96,7 +97,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Task-Tool")
+    @with_analytics(get_analytics, "Task-Tool")
     def task_tool(
         action: str,
         name: str | None = None,
@@ -116,13 +117,13 @@ def register(mcp, *, get_desktop, get_analytics):
         if action != "list" and not name:
             raise ValueError(f"name required for action='{action}'")
 
-        if action in ("disable", "delete", "create"):
-            gated = safety.gate(
-                f"task.{action}:{name}",
-                f"{action} scheduled task {name}",
-                confirm,
-                dangerous=True,
-            )
+        if action in ("run", "enable", "disable", "delete", "create"):
+            key = f"task.{action}:{path}:{name}"
+            if action == "create":
+                # bind the payload too — a token for one program must not
+                # authorize a different program under the same task name
+                key += f":{safety.digest(program, arguments, trigger, run_level)}"
+            gated = safety.gate(key, f"{action} scheduled task {name}", confirm, dangerous=True)
             if gated:
                 return gated
 
@@ -138,7 +139,7 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "create" and not program:
             raise ValueError("program required for action='create'")
         result = dispatch[action]()
-        if action in ("disable", "delete", "create"):
+        if action in ("run", "enable", "disable", "delete", "create"):
             safety.audit(f"task.{action}", name)
         return _fmt(result)
 
@@ -157,7 +158,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Env-Tool")
+    @with_analytics(get_analytics, "Env-Tool")
     def env_tool(
         action: str,
         name: str | None = None,
@@ -175,11 +176,14 @@ def register(mcp, *, get_desktop, get_analytics):
         if action == "set" and value is None:
             raise ValueError("value required for action='set'")
         if action in ("set", "delete"):
+            # user-scope writes to the gate policy var would persistently
+            # downgrade the safety gate for future sessions — always dangerous
+            protected = name.strip().upper() in {"WINDOWS_MCP_REQUIRE_CONFIRM"}
             gated = safety.gate(
                 f"env.{action}:{scope}:{name}",
                 f"{action} environment variable {scope}:{name}",
                 confirm,
-                dangerous=scope == "machine",
+                dangerous=scope == "machine" or protected,
             )
             if gated:
                 return gated
@@ -212,7 +216,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "DevMode-Tool")
+    @with_analytics(get_analytics, "DevMode-Tool")
     def devmode_tool(
         action: str,
         name: str | None = None,
@@ -234,14 +238,14 @@ def register(mcp, *, get_desktop, get_analytics):
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
         enabled_b = _as_bool(enabled)
 
-        gated_actions = {"set_developer_mode", "set_feature"}
+        gated_actions = {"set_developer_mode", "set_feature", "set_explorer_pref"}
         if action in gated_actions:
             target = name or "developer_mode"
             gated = safety.gate(
                 f"devmode.{action}:{target}",
                 f"{action} {'enable' if enabled_b else 'disable'} {target}",
                 confirm,
-                dangerous=True,
+                dangerous=action != "set_explorer_pref",
             )
             if gated:
                 return gated

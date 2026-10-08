@@ -261,22 +261,12 @@ def Click(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.LeftDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    # Button events fire at the current cursor position — passing Absolute
+    # without VirtualDesk would normalize against the *primary* monitor only
+    # and click the wrong spot on multi-monitor setups.
+    mouse_event(MouseEventFlag.LeftDown, 0, 0, 0, 0)
     time.sleep(0.05)
-    mouse_event(
-        MouseEventFlag.LeftUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.LeftUp, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -288,22 +278,9 @@ def MiddleClick(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.MiddleDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.MiddleDown, 0, 0, 0, 0)
     time.sleep(0.05)
-    mouse_event(
-        MouseEventFlag.MiddleUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.MiddleUp, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -315,22 +292,9 @@ def RightClick(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.RightDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.RightDown, 0, 0, 0, 0)
     time.sleep(0.05)
-    mouse_event(
-        MouseEventFlag.RightUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.RightUp, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -342,14 +306,7 @@ def PressMouse(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> None:
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.LeftDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.LeftDown, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -358,15 +315,7 @@ def ReleaseMouse(waitTime: float = OPERATION_WAIT_TIME) -> None:
     Release left mouse.
     waitTime: float.
     """
-    x, y = GetCursorPos()
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.LeftUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.LeftUp, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -378,14 +327,7 @@ def RightPressMouse(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> No
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.RightDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.RightDown, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -394,15 +336,7 @@ def RightReleaseMouse(waitTime: float = OPERATION_WAIT_TIME) -> None:
     Release right mouse.
     waitTime: float.
     """
-    x, y = GetCursorPos()
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.RightUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.RightUp, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -414,14 +348,7 @@ def MiddlePressMouse(x: int, y: int, waitTime: float = OPERATION_WAIT_TIME) -> N
     waitTime: float.
     """
     SetCursorPos(x, y)
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.MiddleDown | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.MiddleDown, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -430,15 +357,7 @@ def MiddleReleaseMouse(waitTime: float = OPERATION_WAIT_TIME) -> None:
     Release middle mouse.
     waitTime: float.
     """
-    x, y = GetCursorPos()
-    screenWidth, screenHeight = GetScreenSize()
-    mouse_event(
-        MouseEventFlag.MiddleUp | MouseEventFlag.Absolute,
-        x * 65535 // screenWidth,
-        y * 65535 // screenHeight,
-        0,
-        0,
-    )
+    mouse_event(MouseEventFlag.MiddleUp, 0, 0, 0, 0)
     time.sleep(waitTime)
 
 
@@ -1508,7 +1427,15 @@ def _VKtoSC(key: int) -> int:
     """
     if key in _SCKeys:
         return _SCKeys[key]
-    scanCode = ctypes.windll.user32.MapVirtualKeyA(key, 0)
+    # MAPVK_VK_TO_VSC_EX (4) returns the E0/E1 extended-key prefix in the
+    # high byte. MAPVK_VK_TO_VSC (0) strips it, which made raw-mode input
+    # emit numpad scancodes for arrows, Ins/Del/Home/End/PgUp/PgDn — the
+    # exact keys games/RDP distinguish by the extended bit.
+    try:
+        hkl = ctypes.windll.user32.GetKeyboardLayout(0)
+        scanCode = ctypes.windll.user32.MapVirtualKeyExW(key, 4, hkl)
+    except AttributeError:
+        scanCode = ctypes.windll.user32.MapVirtualKeyA(key, 0)
     if not scanCode:
         return 0
     keyList = [
@@ -1518,7 +1445,7 @@ def _VKtoSC(key: int) -> int:
         Keys.VK_DIVIDE,
         Keys.VK_NUMLOCK,
     ]
-    if key in keyList:
+    if key in keyList and not (scanCode & 0xFF00):
         scanCode |= 0x0100
     return scanCode
 

@@ -1,21 +1,39 @@
 from dataclasses import dataclass
 import logging
 import os
+import threading
 from _ctypes import COMError
 
 from PIL import Image, ImageGrab
 
-try:
-    import dxcam
-except Exception:
-    dxcam = None
+# dxcam costs ~4-5s to import (DXGI + numpy init) — defer it to first use
+# so server startup and non-screenshot tools never pay for it.
+# ``dxcam`` stays a module-level seam so tests can patch it: the _LAZY
+# sentinel means "not imported yet", None means "unavailable", anything else
+# is used as the module object.
+_LAZY = object()
+dxcam: object = _LAZY
+_dxcam_lock = threading.Lock()
+
+
+def _dxcam():
+    global dxcam
+    if dxcam is _LAZY:
+        try:
+            import dxcam as mod
+        except Exception:
+            dxcam = None
+        else:
+            dxcam = mod
+    return dxcam
+
 
 try:
     import mss
 except ImportError:
     mss = None
 
-import windows_mcp.uia as uia
+import windows_mcp.uia as uia  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +130,11 @@ class _DxcamBackend(_ScreenshotBackend):
 
     @staticmethod
     def _iter_outputs() -> list[DxcamOutput]:
-        if dxcam is None:
+        mod = _dxcam()
+        if mod is None:
             return []
 
-        factory = getattr(dxcam, "__factory", None)
+        factory = getattr(mod, "__factory", None)
         if factory is None:
             return []
 
@@ -178,23 +197,26 @@ class _DxcamBackend(_ScreenshotBackend):
         return None
 
     def is_available(self, capture_rect: uia.Rect | None) -> bool:
-        if dxcam is None:
+        if _dxcam() is None:
             return False
         if capture_rect is None:
             return False
         return self._resolve_region(capture_rect) is not None
 
     def _get_camera(self, device_idx: int, output_idx: int) -> object:
+        # DXGI allows only one duplication per output — serialize creation
+        # and capture or concurrent screenshots race the camera cache.
         camera_key = (device_idx, output_idx)
-        camera = self._camera_cache.get(camera_key)
-        if camera is None:
-            camera = dxcam.create(
-                device_idx=device_idx,
-                output_idx=output_idx,
-                processor_backend="numpy",
-            )
-            self._camera_cache[camera_key] = camera
-        return camera
+        with _dxcam_lock:
+            camera = self._camera_cache.get(camera_key)
+            if camera is None:
+                camera = _dxcam().create(
+                    device_idx=device_idx,
+                    output_idx=output_idx,
+                    processor_backend="numpy",
+                )
+                self._camera_cache[camera_key] = camera
+            return camera
 
     def capture(self, capture_rect: uia.Rect | None) -> Image.Image:
         resolved = self._resolve_region(capture_rect)
@@ -204,7 +226,9 @@ class _DxcamBackend(_ScreenshotBackend):
             )
         device_idx, output_idx, region = resolved
         camera = self._get_camera(device_idx, output_idx)
-        frame = camera.grab(region=region, copy=True, new_frame_only=False)
+        # dxcam cameras share internal buffers — grab must be serialized too
+        with _dxcam_lock:
+            frame = camera.grab(region=region, copy=True, new_frame_only=False)
         if frame is None:
             raise RuntimeError("DXGI capture returned no frame")
         return Image.fromarray(frame)

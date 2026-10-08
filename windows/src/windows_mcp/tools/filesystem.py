@@ -4,9 +4,13 @@ import os
 from typing import Literal
 
 from mcp.types import ToolAnnotations
+from windows_mcp import safety
 from windows_mcp.infrastructure import with_analytics
 from windows_mcp import filesystem
 from fastmcp import Context
+
+
+_MUTATING_MODES = {"write", "copy", "move", "delete"}
 
 
 def register(mcp, *, get_desktop, get_analytics):
@@ -21,7 +25,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "FileSystem-Tool")
+    @with_analytics(get_analytics, "FileSystem-Tool")
     def file_system_tool(
         mode: Literal['read', 'write', 'copy', 'move', 'delete', 'list', 'search', 'info'],
         path: str,
@@ -35,6 +39,7 @@ def register(mcp, *, get_desktop, get_analytics):
         limit: int | None = None,
         encoding: str = 'utf-8',
         show_hidden: bool | str = False,
+        confirm: str | None = None,
         ctx: Context = None,
     ) -> str:
         try:
@@ -50,23 +55,34 @@ def register(mcp, *, get_desktop, get_analytics):
             overwrite = overwrite is True or (isinstance(overwrite, str) and overwrite.lower() == 'true')
             show_hidden = show_hidden is True or (isinstance(show_hidden, str) and show_hidden.lower() == 'true')
 
+            if mode in _MUTATING_MODES:
+                gated = safety.gate(
+                    f"fs.{mode}:{safety.digest(path, destination)}",
+                    f"{mode} '{path}'" + (f" -> '{destination}'" if destination else ""),
+                    confirm,
+                    dangerous=mode in ("write", "move", "delete") or bool(overwrite),
+                )
+                if gated:
+                    return gated
+
+            result: str | None = None
             match mode:
                 case 'read':
                     return filesystem.read_file(path, offset=offset, limit=limit, encoding=encoding)
                 case 'write':
                     if content is None:
                         return 'Error: content parameter is required for write mode.'
-                    return filesystem.write_file(path, content, append=append, encoding=encoding)
+                    result = filesystem.write_file(path, content, append=append, encoding=encoding)
                 case 'copy':
                     if destination is None:
                         return 'Error: destination parameter is required for copy mode.'
-                    return filesystem.copy_path(path, destination, overwrite=overwrite)
+                    result = filesystem.copy_path(path, destination, overwrite=overwrite)
                 case 'move':
                     if destination is None:
                         return 'Error: destination parameter is required for move mode.'
-                    return filesystem.move_path(path, destination, overwrite=overwrite)
+                    result = filesystem.move_path(path, destination, overwrite=overwrite)
                 case 'delete':
-                    return filesystem.delete_path(path, recursive=recursive)
+                    result = filesystem.delete_path(path, recursive=recursive)
                 case 'list':
                     return filesystem.list_directory(path, pattern=pattern, recursive=recursive, show_hidden=show_hidden)
                 case 'search':
@@ -77,5 +93,7 @@ def register(mcp, *, get_desktop, get_analytics):
                     return filesystem.get_file_info(path)
                 case _:
                     return f'Error: Unknown mode "{mode}". Use: read, write, copy, move, delete, list, search, info.'
-        except Exception as e:
+            safety.audit(f"fs.{mode}", f"{path} -> {destination or ''}")
+            return result
+        except Exception:
             raise

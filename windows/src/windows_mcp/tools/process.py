@@ -3,6 +3,7 @@
 from typing import Literal
 
 from mcp.types import ToolAnnotations
+from windows_mcp import safety
 from windows_mcp.infrastructure import with_analytics
 from fastmcp import Context
 from windows_mcp import process
@@ -20,7 +21,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Process-Tool")
+    @with_analytics(get_analytics, "Process-Tool")
     def process_tool(
         mode: Literal["list", "kill"],
         name: str | None = None,
@@ -28,6 +29,7 @@ def register(mcp, *, get_desktop, get_analytics):
         sort_by: Literal["memory", "cpu", "name"] = "memory",
         limit: int = 20,
         force: bool | str = False,
+        confirm: str | None = None,
         ctx: Context = None,
     ) -> str:
         try:
@@ -35,8 +37,18 @@ def register(mcp, *, get_desktop, get_analytics):
                 return process.list_processes(name=name, sort_by=sort_by, limit=limit)
             elif mode == "kill":
                 force = force is True or (isinstance(force, str) and force.lower() == "true")
-                return process.kill_process(name=name, pid=pid, force=force)
+                gated = safety.gate(
+                    f"process.kill:{pid if pid is not None else name}",
+                    f"kill process {pid if pid is not None else name}",
+                    confirm,
+                    dangerous=True,
+                )
+                if gated:
+                    return gated
+                result = process.kill_process(name=name, pid=pid, force=force)
+                safety.audit("process.kill", f"{pid if pid is not None else name}")
+                return result
             else:
                 return 'Error: mode must be either "list" or "kill".'
-        except Exception as e:
+        except Exception:
             raise

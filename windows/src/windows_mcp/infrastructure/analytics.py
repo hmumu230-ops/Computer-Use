@@ -1,15 +1,22 @@
-from typing import Dict, Any, TypeVar, Callable, Protocol, Awaitable
+from typing import Dict, Any, TypeVar, Callable, Protocol, Awaitable, TYPE_CHECKING
 from windows_mcp.infrastructure.config import CONFIG_DIR
 from uuid_extensions import uuid7str
-from fastmcp import Context
 from functools import wraps
 from pathlib import Path
 import inspect
-import posthog
 import asyncio
 import logging
 import time
 import os
+
+if TYPE_CHECKING:
+    from fastmcp import Context
+
+
+def _is_context(value: Any) -> bool:
+    """Duck-type check for fastmcp.Context — avoids importing fastmcp (~5s
+    cold) just to spot a ctx argument in tool wrappers."""
+    return type(value).__name__ == "Context" and hasattr(value, "session")
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,9 @@ class PostHogAnalytics:
         if not self.API_KEY:
             logger.warning("PostHog API key is empty; analytics client will not be initialized")
             return
+
+        # Lazy: posthog pulls requests/urllib3 — not worth paying at import.
+        import posthog
 
         self.client = posthog.Posthog(
             self.API_KEY,
@@ -144,23 +154,39 @@ class PostHogAnalytics:
             logger.debug("Closed analytics")
 
 
-def with_analytics(analytics_instance: Analytics | None, tool_name: str):
-    """
-    Decorator to wrap tool functions with analytics tracking.
+def with_analytics(
+    analytics_source: "Analytics | Callable[[], Analytics | None] | None",
+    tool_name: str,
+):
+    """Wrap a tool function with analytics tracking.
+
+    ``analytics_source`` may be an Analytics instance, ``None``, or — the
+    preferred form — a zero-arg callable returning the instance. Passing the
+    callable defers lookup to call time: tool registration runs before the
+    server lifespan creates the analytics singleton, so evaluating
+    ``get_analytics()`` at decoration captures None forever and silently
+    disables all tracking.
     """
 
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         @wraps(func)
         async def wrapper(*args, **kwargs) -> T:
+            analytics_instance = (
+                analytics_source
+                if hasattr(analytics_source, "track_tool")
+                else analytics_source()
+                if callable(analytics_source)
+                else analytics_source
+            )
             start = time.time()
 
             # Capture client info from Context passed as argument
             client_data = {}
             try:
-                ctx = next((arg for arg in args if isinstance(arg, Context)), None)
+                ctx = next((arg for arg in args if _is_context(arg)), None)
                 if not ctx:
                     ctx = next(
-                        (val for val in kwargs.values() if isinstance(val, Context)),
+                        (val for val in kwargs.values() if _is_context(val)),
                         None,
                     )
 

@@ -29,7 +29,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Multi-Select-Tool")
+    @with_analytics(get_analytics, "Multi-Select-Tool")
     def multi_select_tool(
         locs: list[list[int]] | str | None = None,
         labels: list[int] | str | None = None,
@@ -57,6 +57,14 @@ def register(mcp, *, get_desktop, get_analytics):
             except Exception as e:
                 raise ValueError(f"Failed to resolve labels {labels}: {e}")
 
+        for item in locs:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 2
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in item)
+            ):
+                raise ValueError(f"Each locs item must be [x, y] numbers. Invalid: {item!r}")
+
         press_ctrl = press_ctrl is True or (
             isinstance(press_ctrl, str) and press_ctrl.lower() == "true"
         )
@@ -83,7 +91,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Multi-Edit-Tool")
+    @with_analytics(get_analytics, "Multi-Edit-Tool")
     def multi_edit_tool(
         locs: list[list] | str | None = None,
         labels: list[list] | str | None = None,

@@ -40,6 +40,8 @@ def test_shell_tool_error_is_error_true(monkeypatch, mcp):
     from windows_mcp.tools.shell import register as shell_tool_reg
     from windows_mcp.powershell import PowerShellExecutor
 
+    # exercising error propagation, not the confirm gate
+    monkeypatch.setenv("WINDOWS_MCP_REQUIRE_CONFIRM", "off")
     shell_tool_reg(mcp, get_desktop=lambda: None, get_analytics=lambda: None)
     error_msg = "command rejected"
 

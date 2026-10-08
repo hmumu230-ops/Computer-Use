@@ -9,6 +9,13 @@ import pytest
 from windows_mcp.tools import app
 
 
+@pytest.fixture(autouse=True)
+def _gate_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The App tool gates launch_executable behind a confirm token; these tests
+    # exercise mechanics, not the gate — except the dedicated gate test below.
+    monkeypatch.setenv("WINDOWS_MCP_REQUIRE_CONFIRM", "off")
+
+
 class FakeMCP:
     def __init__(self) -> None:
         self.tools: dict[str, Callable] = {}
@@ -105,6 +112,32 @@ def test_launch_executable_preserves_argv_and_uses_no_shell(
     annotations = mcp.tool_options["App"]["annotations"]
     assert annotations.destructiveHint is True
     assert annotations.idempotentHint is False
+
+
+def test_launch_executable_gated_then_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WINDOWS_MCP_REQUIRE_CONFIRM", "dangerous")
+    exe = tmp_path / "app.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        app.subprocess,
+        "Popen",
+        lambda *args, **kwargs: SimpleNamespace(pid=1),
+    )
+    tool = _mcp().tools["App"]
+
+    blocked = asyncio.run(tool(mode="launch_executable", executable=str(exe)))
+    assert blocked.startswith("CONFIRM_REQUIRED")
+    token = blocked.split("confirm='")[1].split("'")[0]
+
+    result = json.loads(
+        asyncio.run(
+            tool(mode="launch_executable", executable=str(exe), confirm=token)
+        )
+    )
+    assert result["pid"] == 1
 
 
 def test_launch_executable_accepts_json_string_args(

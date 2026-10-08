@@ -37,7 +37,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "System-Tool")
+    @with_analytics(get_analytics, "System-Tool")
     def system_tool(
         action: str,
         timeout_sec: int = 0,
@@ -55,12 +55,14 @@ def register(mcp, *, get_desktop, get_analytics):
         if action not in valid:
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
 
-        key = f"system.{action}"
-        gated = safety.gate(
-            key, f"System action '{action}'", confirm, dangerous=action in dangerous
-        )
-        if gated:
-            return gated
+        if action not in readonly:
+            # bind every parameter that changes what the action does
+            key = f"system.{action}:{safety.digest(timeout_sec, force_b, plan)}"
+            gated = safety.gate(
+                key, f"System action '{action}'", confirm, dangerous=action in dangerous
+            )
+            if gated:
+                return gated
 
         dispatch = {
             "lock": power.lock,
@@ -80,7 +82,10 @@ def register(mcp, *, get_desktop, get_analytics):
             raise ValueError("plan is required for set_power_plan (guid or scheme name)")
         out, rc = dispatch[action]()
         if action in dangerous and rc == 0:
-            safety.audit(key, f"System action '{action}' executed")
+            safety.audit(
+                f"system.{action}:{safety.digest(timeout_sec, force_b, plan)}",
+                f"System action '{action}' executed",
+            )
         return _fmt((out, rc))
 
     @mcp.tool(
@@ -101,7 +106,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Window-Tool")
+    @with_analytics(get_analytics, "Window-Tool")
     def window_tool(
         action: str,
         window: str | None = None,
@@ -130,10 +135,15 @@ def register(mcp, *, get_desktop, get_analytics):
         }
         if action not in valid:
             raise ValueError(f"action must be one of: {', '.join(sorted(valid))}")
+        resolved_hwnd: int | None = None
         if action == "close":
+            # resolve the target *before* gating so the token binds the actual
+            # hwnd that gets closed (title-string matching would be a TOCTOU —
+            # the window set can change between gate and dispatch)
+            resolved_hwnd = windows._resolve_window(window, hwnd)
             gated = safety.gate(
-                f"window.close:{window or hwnd}",
-                f"close window {window or hwnd or 'foreground'}",
+                f"window.close:{resolved_hwnd}",
+                f"close window hwnd={resolved_hwnd}",
                 confirm,
                 dangerous=True,
             )
@@ -149,7 +159,7 @@ def register(mcp, *, get_desktop, get_analytics):
             "topmost": lambda: windows.set_topmost(window, True, hwnd),
             "untopmost": lambda: windows.set_topmost(window, False, hwnd),
             "move": lambda: windows.move_resize(window, x, y, width, height, hwnd),
-            "close": lambda: windows.close_window(window, hwnd),
+            "close": lambda: windows.close_window(None, resolved_hwnd),
             "focus": lambda: windows.bring_to_front(window, hwnd),
             "snap": lambda: windows.snap(window, side, hwnd),
         }
@@ -173,7 +183,7 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "EventLog-Tool")
+    @with_analytics(get_analytics, "EventLog-Tool")
     def eventlog_tool(
         action: str = "query",
         log_name: str = "Application",
@@ -203,6 +213,6 @@ def register(mcp, *, get_desktop, get_analytics):
             openWorldHint=False,
         ),
     )
-    @with_analytics(get_analytics(), "Identity-Tool")
+    @with_analytics(get_analytics, "Identity-Tool")
     def identity_tool(ctx: Context = None) -> str:
         return _fmt(identity.whoami())

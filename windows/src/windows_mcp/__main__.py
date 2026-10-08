@@ -1,26 +1,14 @@
 from contextlib import asynccontextmanager
 from windows_mcp.config import enable_debug
-from windows_mcp.infrastructure import (
-    AuthKeyMiddleware,
-    OAuthOnlyMiddleware,
-    is_loopback_host,
-    IPAllowlistMiddleware,
-    parse_ip_allowlist,
+from windows_mcp.infrastructure.config import (
     CONFIG_DIR,
     CONFIG_FILE,
     WindowsMCPConfig,
     discover_config_path,
     load_config,
     write_config,
-    OAuthStore,
-    build_oauth_routes,
-    validate_oauth_token,
-    install_selfpipe_guard,
 )
 from click.core import ParameterSource
-from fastmcp import FastMCP
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from textwrap import dedent
 from enum import Enum
 from typing import Any, NoReturn
@@ -33,6 +21,11 @@ import click
 import os
 import sys
 import time
+
+# Heavy imports (fastmcp, starlette, windows_mcp.infrastructure submodules)
+# live inside the functions that need them — the MCP handshake deadline is
+# unforgiving, and CLI paths like `tools`/`call`/`doctor` shouldn't pay for
+# the serving stack at all.
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +55,7 @@ desktop: Any | None = None
 watchdog: Any | None = None
 analytics: Any | None = None
 screen_size: Any | None = None
-_mcp: FastMCP | None = None
+_mcp = None
 
 instructions = dedent("""
 Windows MCP server provides tools to interact directly with the Windows desktop,
@@ -86,13 +79,19 @@ def _http_middleware(
     allowed_hosts: list[str] | None = None,
 ) -> list:
     """Return ASGI middleware for HTTP transports."""
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from windows_mcp.infrastructure import (
+        AuthKeyMiddleware,
+        OAuthOnlyMiddleware,
+        IPAllowlistMiddleware,
+    )
+
     middleware: list = [
         Middleware(OptionsMiddleware, allowed_origins=cors_origins or []),
     ]
     if allowed_hosts:
-        from starlette.middleware.trustedhost import TrustedHostMiddleware
-
-        middleware.append(Middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts))
+        middleware.append(Middleware(_AllowedHostMiddleware, allowed_hosts=allowed_hosts))
     if cors_origins:
         middleware.append(
             Middleware(
@@ -112,6 +111,14 @@ def _http_middleware(
     elif oauth_validator:
         middleware.append(Middleware(OAuthOnlyMiddleware, oauth_validator=oauth_validator))
     return middleware
+
+
+def build_oauth_routes(**kwargs):
+    """Lazy shim — keeps `cli.build_oauth_routes` patchable in tests while
+    deferring the starlette-heavy oauth module to HTTP serving only."""
+    from windows_mcp.infrastructure import build_oauth_routes as _impl
+
+    return _impl(**kwargs)
 
 
 def _param_explicit(ctx: click.Context, name: str) -> bool:
@@ -239,7 +246,7 @@ def _start_watchdog(desktop):
         return None
 
 
-def _build_mcp() -> FastMCP:
+def _build_mcp() -> "FastMCP":  # noqa: F821 — fastmcp is imported lazily
     """Create the MCP server instance."""
     global _mcp
 
@@ -247,6 +254,7 @@ def _build_mcp() -> FastMCP:
         return _mcp
 
     try:
+        from fastmcp import FastMCP
         from windows_mcp.infrastructure import PostHogAnalytics
         from windows_mcp.desktop.service import Desktop
         from windows_mcp.tools import register_all
@@ -254,7 +262,7 @@ def _build_mcp() -> FastMCP:
         _exit_missing_dependency(exc)
 
     @asynccontextmanager
-    async def lifespan(app: FastMCP):
+    async def lifespan(app):
         """Runs initialization code before the server starts and cleanup code after it shuts down."""
         global desktop, watchdog, analytics, screen_size
 
@@ -347,6 +355,45 @@ class _LegacyAwareGroup(click.Group):
         return None
 
 
+class _AllowedHostMiddleware:
+    """Pure-ASGI Host allowlist that understands IPv6 literals.
+
+    Starlette's TrustedHostMiddleware does ``host.split(":")[0]`` which turns
+    ``[::1]:8000`` into ``"["`` — IPv6 loopback clients can never match, so
+    --host ::1 was unreachable. This parser strips brackets and the port,
+    then compares the bare address.
+    """
+
+    def __init__(self, app, allowed_hosts: list[str]):
+        self.app = app
+        self.allowed = {h.strip().lower().strip("[]") for h in allowed_hosts}
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            host = ""
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    host = value.decode("latin-1").strip().lower()
+                    break
+            if host:
+                if host.startswith("["):
+                    host = host[1:].split("]", 1)[0]
+                elif ":" in host:
+                    host = host.split(":", 1)[0]
+                if host not in self.allowed:
+                    body = b"Invalid host header"
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 400,
+                            "headers": [(b"content-type", b"text/plain")],
+                        }
+                    )
+                    await send({"type": "http.response.body", "body": body})
+                    return
+        await self.app(scope, receive, send)
+
+
 def _apply_tool_filter(
     mcp, explicit_tools: list[str] | None, exclude_tools: list[str] | None
 ) -> None:
@@ -385,10 +432,22 @@ def _apply_tool_filter(
         registered = set(tools_dict.keys())
 
     if explicit_tools:
-        keep = {t for t in explicit_tools if t in registered}
+        unknown = set(explicit_tools) - registered
+        if unknown:
+            available = ", ".join(sorted(registered))
+            raise click.ClickException(
+                f"--tools contains unknown tool name(s): {sorted(unknown)}. "
+                f"Registered tools: {available}"
+            )
+        keep = set(explicit_tools)
         for name in registered - keep:
             _remove(name)
     elif exclude_tools:
+        unknown = set(exclude_tools) - registered
+        if unknown:
+            logger.warning(
+                "--exclude-tools name(s) not registered (ignored): %s", sorted(unknown)
+            )
         for name in exclude_tools:
             if name in registered:
                 _remove(name)
@@ -516,7 +575,9 @@ def main():
 )
 @click.option(
     "--exclude-tools",
-    help="Comma-separated list of tools to remove from the active set (e.g. 'PowerShell,Registry').",
+    "--disable-tools",
+    "exclude_tools",
+    help="Comma-separated list of tools to remove from the active set (e.g. 'PowerShell,Registry'). --disable-tools is a deprecated alias.",
     default=None,
     envvar="WINDOWS_MCP_EXCLUDE_TOOLS",
     type=str,
@@ -589,7 +650,19 @@ def serve(
     oauth_client_secret,
     stateless_http,
 ):
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    from windows_mcp.infrastructure import (
+        is_loopback_host,
+        parse_ip_allowlist,
+        OAuthStore,
+        validate_oauth_token,
+        install_selfpipe_guard,
+    )
+
+    # SelectorEventLoop policy gives ProactorEventLoop's subprocess support
+    # away; deprecated in 3.14, removed in 3.16 — guard for forward compat.
+    _sel_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if _sel_policy is not None:
+        asyncio.set_event_loop_policy(_sel_policy())
     install_selfpipe_guard()
     if transport == Transport.STDIO.value:
         os.environ.setdefault("NO_COLOR", "1")
@@ -613,6 +686,11 @@ def serve(
     stateless_http = bool(
         _choose_value(ctx, "stateless_http", stateless_http, cfg.server.stateless_http, False)
     )
+    if stateless_http and transport == Transport.SSE.value:
+        raise click.ClickException(
+            "--stateless-http applies only to streamable-http; the SSE "
+            "transport does not support stateless mode."
+        )
     allow_insecure_remote = bool(
         _choose_value(
             ctx,
@@ -700,7 +778,13 @@ def serve(
         mcp = _build_mcp()
         oauth_store = OAuthStore()
         scheme = "https" if (ssl_certfile and ssl_keyfile) else "http"
-        issuer = f"{scheme}://{host}:{port}"
+        # Wildcard binds aren't a reachable issuer; IPv6 needs brackets.
+        issuer_host = host
+        if issuer_host in ("0.0.0.0", "::", ""):
+            issuer_host = "localhost"
+        elif ":" in issuer_host and not issuer_host.startswith("["):
+            issuer_host = f"[{issuer_host}]"
+        issuer = f"{scheme}://{issuer_host}:{port}"
         routes = build_oauth_routes(
             store=oauth_store,
             issuer=issuer,
@@ -811,7 +895,18 @@ def _gen_tls(host: str, cert_path, key_path) -> None:
 
 
 _TASK_NAME = "windows-mcp-server"
+
+
+def _config_dir():
+    return CONFIG_DIR
+
+
 _START_SCRIPT_PATH = CONFIG_DIR / "start-server.cmd"
+
+
+def _start_script_path():
+    # read the module global at call time so tests can patch it
+    return globals()["_START_SCRIPT_PATH"]
 
 
 def _resolve_program() -> list[str]:
@@ -824,8 +919,8 @@ def _resolve_program() -> list[str]:
 
 
 def _build_start_script(program_args: list[str]) -> str:
-    log_out = CONFIG_DIR / "server.log"
-    log_err = CONFIG_DIR / "server.error.log"
+    log_out = _config_dir() / "server.log"
+    log_err = _config_dir() / "server.error.log"
     command = subprocess.list2cmdline(program_args)
     return f'@echo off\nsetlocal\n{command} 1>>"{log_out}" 2>>"{log_err}"\n'
 
@@ -840,11 +935,15 @@ def _register_task_powershell(task_name: str, script_path: str) -> subprocess.Co
     Unlike `schtasks /Create /SC ONLOGON`, Register-ScheduledTask with
     -RunLevel Limited does not require an elevated shell.
     """
+    # Single-quote escape inside PS single-quoted strings (' → '') —
+    # a username like O'Brien in the profile path would break the command.
+    safe_script = script_path.replace("'", "''")
+    safe_task = task_name.replace("'", "''")
     ps = (
-        f"$action  = New-ScheduledTaskAction -Execute '{script_path}';"
+        f"$action  = New-ScheduledTaskAction -Execute '{safe_script}';"
         f"$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
         f"$set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
-        f"Register-ScheduledTask -TaskName '{task_name}' -Action $action"
+        f"Register-ScheduledTask -TaskName '{safe_task}' -Action $action"
         f" -Trigger $trigger -Settings $set -RunLevel Limited -Force"
     )
     return subprocess.run(
@@ -873,16 +972,44 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
         click.echo("Use --force to reinstall.")
         return
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _config_dir().mkdir(parents=True, exist_ok=True)
+
+    # An installed service that authenticates nothing lets any local process
+    # drive the desktop. If there's no config yet, mint an auth key into a
+    # fresh config.toml so `serve` starts with a bearer requirement. An
+    # existing config is left untouched.
+    config_file = _config_dir() / "config.toml"
+    generated_key = None
+    if not config_file.exists():
+        cfg = WindowsMCPConfig()
+        generated_key = secrets.token_urlsafe(32)
+        cfg.server.auth_key = generated_key
+        cfg.server.transport = transport
+        cfg.server.host = host
+        cfg.server.port = port
+        write_config(cfg, config_file)
+    else:
+        try:
+            cfg_existing = load_config(config_file)
+        except (FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(str(exc))
+        from windows_mcp.infrastructure import is_loopback_host
+
+        if not cfg_existing.server.auth_key and not is_loopback_host(host):
+            raise click.ClickException(
+                f"install --host {host} would start an unauthenticated remote "
+                "server every login (serve would refuse and the task would "
+                "die). Set server.auth_key in config.toml or use a loopback host."
+            )
 
     exe = _resolve_program()
     args = exe + ["serve", "--transport", transport, "--host", host, "--port", str(port)]
-    _START_SCRIPT_PATH.write_text(_build_start_script(args), encoding="utf-8")
+    _start_script_path().write_text(_build_start_script(args), encoding="utf-8")
 
     # Remove any existing task first when forcing a reinstall.
     _schtasks("/Delete", "/TN", _TASK_NAME, "/F")
 
-    result = _register_task_powershell(_TASK_NAME, str(_START_SCRIPT_PATH))
+    result = _register_task_powershell(_TASK_NAME, str(_start_script_path()))
     if result.returncode != 0:
         raise click.ClickException(
             f"Register-ScheduledTask failed:\n{result.stderr.strip() or result.stdout.strip()}"
@@ -898,7 +1025,9 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
     click.echo(f"  Task      : {_TASK_NAME}")
     click.echo(f"  Transport : {transport}")
     click.echo(f"  Address   : {host}:{port}")
-    click.echo(f"  Logs      : {CONFIG_DIR / 'server.log'}")
+    click.echo(f"  Logs      : {_config_dir() / 'server.log'}")
+    if generated_key:
+        click.echo(f"  Auth key  : {generated_key}  (written to {config_file})")
     click.echo("\nThe server will restart automatically at every login.")
     click.echo("Run `windows-mcp uninstall` to remove it.")
 
@@ -916,9 +1045,9 @@ def uninstall() -> None:
     else:
         click.echo("No scheduled task found.")
 
-    if _START_SCRIPT_PATH.exists():
-        _START_SCRIPT_PATH.unlink()
-        click.echo(f"Removed {_START_SCRIPT_PATH}")
+    if _start_script_path().exists():
+        _start_script_path().unlink()
+        click.echo(f"Removed {_start_script_path()}")
 
     click.echo("windows-mcp will no longer start at login.")
 
@@ -956,7 +1085,7 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
         click.echo(f"Auth key already set in {config_path}. Use --force to regenerate.")
         return
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _config_dir().mkdir(parents=True, exist_ok=True)
 
     new_key = secrets.token_urlsafe(32)
     cfg.server.auth_key = new_key
@@ -968,8 +1097,8 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
     if with_tls:
         if transport == "stdio":
             raise click.ClickException("TLS has no effect on stdio transport.")
-        cert_path = CONFIG_DIR / "cert.pem"
-        key_path = CONFIG_DIR / "key.pem"
+        cert_path = _config_dir() / "cert.pem"
+        key_path = _config_dir() / "key.pem"
         _gen_tls(host, cert_path, key_path)
         cfg.server.ssl_certfile = str(cert_path)
         cfg.server.ssl_keyfile = str(key_path)
@@ -1051,7 +1180,8 @@ def _parse_call_args(pairs: list[str]) -> dict:
     kwargs = {}
     for pair in pairs:
         key, sep, raw = pair.partition("=")
-        if not sep:
+        key = key.strip()
+        if not sep or not key:
             raise click.ClickException(f"--arg must be key=value, got {pair!r}")
         try:
             kwargs[key] = _json.loads(raw)
@@ -1068,7 +1198,8 @@ def _utf8_stdout() -> None:
 
 
 def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
-    """Print a tool result; Image payloads are written to PNG files."""
+    """Print a tool result; image payloads are written to files."""
+    import base64
     import json as _json
 
     _utf8_stdout()
@@ -1077,14 +1208,33 @@ def _emit_result(result, json_out: bool, save_dir: str | None) -> None:
     out = []
     counter = 0
     for item in items:
-        if getattr(item, "data", None) is not None and getattr(item, "mimeType", ""):
+        # fastmcp Image exposes `_mime_type`; mcp.types.ImageContent exposes
+        # `mimeType`. Either may carry `data` (bytes or base64 str) or `path`.
+        mime = getattr(item, "mimeType", None) or getattr(item, "_mime_type", None)
+        data = getattr(item, "data", None)
+        img_path = getattr(item, "path", None)
+        if mime or data is not None or img_path:
             counter += 1
             if save_dir is None:
-                save_dir = os.path.join(os.environ.get("LOCALAPPDATA", "."), "windows-mcp", "cli")
+                save_dir = os.path.join(
+                    os.environ.get("LOCALAPPDATA", "."), "windows-mcp", "cli"
+                )
             os.makedirs(save_dir, exist_ok=True)
-            path = os.path.join(save_dir, f"image_{int(time.time())}_{counter}.png")
-            with open(path, "wb") as f:
-                f.write(item.data)
+            ext = (mime or "image/png").split("/")[-1].replace("jpeg", "jpg")
+            path = os.path.join(save_dir, f"image_{int(time.time())}_{counter}.{ext}")
+            if img_path:
+                import shutil
+
+                shutil.copyfile(img_path, path)
+            elif isinstance(data, str):
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(data))
+            elif isinstance(data, (bytes, bytearray)):
+                with open(path, "wb") as f:
+                    f.write(bytes(data))
+            else:
+                out.append(repr(item))
+                continue
             out.append({"image": path})
         elif hasattr(item, "text"):
             out.append(item.text)
