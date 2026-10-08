@@ -20,7 +20,10 @@ def _as_region(value: list | str | None) -> list | None:
     if value is None:
         return None
     if isinstance(value, str):
-        value = json.loads(value)
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            raise ValueError(f"region must be a [left, top, right, bottom] list, got {value!r}")
     if not isinstance(value, (list, tuple)):
         raise ValueError("region must be a [left, top, right, bottom] list")
     return list(value)

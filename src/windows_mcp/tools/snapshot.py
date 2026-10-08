@@ -48,7 +48,10 @@ def register(mcp, *, get_desktop, get_analytics):
     ):
         try:
             if isinstance(display, str):
-                display = json.loads(display)
+                try:
+                    display = json.loads(display)
+                except json.JSONDecodeError:
+                    raise ValueError(f"display must be a list like [0] or [0, 1], got {display!r}")
             capture_result = capture_desktop_state(
                 get_desktop(),
                 use_vision=_as_bool(use_vision),
@@ -96,7 +99,10 @@ def register(mcp, *, get_desktop, get_analytics):
     ):
         try:
             if isinstance(display, str):
-                display = json.loads(display)
+                try:
+                    display = json.loads(display)
+                except json.JSONDecodeError:
+                    raise ValueError(f"display must be a list like [0] or [0, 1], got {display!r}")
             capture_result = capture_desktop_state(
                 get_desktop(),
                 use_vision=True,

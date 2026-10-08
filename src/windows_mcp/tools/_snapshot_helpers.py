@@ -46,7 +46,10 @@ def _as_bool(value: bool | str) -> bool:
 def _as_region(value: list | str | None) -> list | None:
     if value is None or isinstance(value, list):
         return value
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(f"region must be a [left, top, right, bottom] list, got {value!r}")
 
 
 def capture_desktop_state(

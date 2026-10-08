@@ -799,16 +799,17 @@ class Desktop:
     @_serialized_input
     def type(
         self,
-        loc: tuple[int, int],
+        loc: tuple[int, int] | None,
         text: str,
         caret_position: Literal["start", "idle", "end"] = "idle",
         clear: bool | str = False,
         press_enter: bool | str = False,
         raw: bool | str = False,
     ):
-        x, y = loc
         is_raw = raw is True or (isinstance(raw, str) and raw.lower() == "true")
-        uia.Click(x, y)
+        if loc is not None:
+            x, y = loc
+            uia.Click(x, y)
         if caret_position == "start":
             if is_raw:
                 uia.SendScanCode(uia.Keys.VK_HOME)

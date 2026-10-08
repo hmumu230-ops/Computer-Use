@@ -14,7 +14,10 @@ def _as_loc(value: list | str | None) -> list | None:
     """Coerce a JSON-stringified list back to a list (Claude Desktop workaround)."""
     if value is None or isinstance(value, list):
         return value
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(f"expected a JSON list, got {value!r}")
 
 
 def register(mcp, *, get_desktop, get_analytics):

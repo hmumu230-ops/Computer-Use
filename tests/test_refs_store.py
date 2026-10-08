@@ -69,11 +69,15 @@ class FakeWindow(FakeControl):
         return self._find_first
 
 
+_rid_counter = [0]
+
+
 def _locator(**kw) -> ElementLocator:
     import os
 
+    _rid_counter[0] += 1
     defaults = dict(
-        runtime_id=(42, 1, 7),
+        runtime_id=(42, 1, _rid_counter[0]),  # unique per locator, like real UIA
         name="OK",
         control_type="ButtonControl",
         window_handle=1234,
@@ -131,6 +135,25 @@ def test_register_issues_ref_outside_snapshot(store):
     ref = store.register(_locator(synthetic=True))
     assert ref == 1
     assert store.get(ref).synthetic
+
+
+def test_rebuild_reuses_ref_for_same_element(store):
+    """WaitFor-style churn: same element across snapshots keeps its @eN."""
+    first = _locator(runtime_id=(7, 7, 7))
+    second = _locator(runtime_id=(7, 7, 7))  # same identity, new snapshot
+    store.rebuild([first])
+    store.rebuild([second])
+    assert second.ref == first.ref
+    assert store.get(first.ref) is second  # freshest locator wins
+
+
+def test_rebuild_mints_new_ref_for_recycled_runtime_id(store):
+    """A different element reusing a dead RuntimeId must NOT inherit @eN."""
+    dead_button = _locator(runtime_id=(9, 9), name="Save")
+    new_button = _locator(runtime_id=(9, 9), name="Delete")
+    store.rebuild([dead_button])
+    store.rebuild([new_button])
+    assert new_button.ref != dead_button.ref
 
 
 def test_eviction_drops_oldest_refs(store):
