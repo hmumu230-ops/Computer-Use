@@ -1,15 +1,22 @@
-from typing import Dict, Any, TypeVar, Callable, Protocol, Awaitable
+from typing import Dict, Any, TypeVar, Callable, Protocol, Awaitable, TYPE_CHECKING
 from windows_mcp.infrastructure.config import CONFIG_DIR
 from uuid_extensions import uuid7str
-from fastmcp import Context
 from functools import wraps
 from pathlib import Path
 import inspect
-import posthog
 import asyncio
 import logging
 import time
 import os
+
+if TYPE_CHECKING:
+    from fastmcp import Context
+
+
+def _is_context(value: Any) -> bool:
+    """Duck-type check for fastmcp.Context — avoids importing fastmcp (~5s
+    cold) just to spot a ctx argument in tool wrappers."""
+    return type(value).__name__ == "Context" and hasattr(value, "session")
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,9 @@ class PostHogAnalytics:
         if not self.API_KEY:
             logger.warning("PostHog API key is empty; analytics client will not be initialized")
             return
+
+        # Lazy: posthog pulls requests/urllib3 — not worth paying at import.
+        import posthog
 
         self.client = posthog.Posthog(
             self.API_KEY,
@@ -157,10 +167,10 @@ def with_analytics(analytics_instance: Analytics | None, tool_name: str):
             # Capture client info from Context passed as argument
             client_data = {}
             try:
-                ctx = next((arg for arg in args if isinstance(arg, Context)), None)
+                ctx = next((arg for arg in args if _is_context(arg)), None)
                 if not ctx:
                     ctx = next(
-                        (val for val in kwargs.values() if isinstance(val, Context)),
+                        (val for val in kwargs.values() if _is_context(val)),
                         None,
                     )
 

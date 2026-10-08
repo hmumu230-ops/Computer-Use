@@ -1,26 +1,14 @@
 from contextlib import asynccontextmanager
 from windows_mcp.config import enable_debug
-from windows_mcp.infrastructure import (
-    AuthKeyMiddleware,
-    OAuthOnlyMiddleware,
-    is_loopback_host,
-    IPAllowlistMiddleware,
-    parse_ip_allowlist,
+from windows_mcp.infrastructure.config import (
     CONFIG_DIR,
     CONFIG_FILE,
     WindowsMCPConfig,
     discover_config_path,
     load_config,
     write_config,
-    OAuthStore,
-    build_oauth_routes,
-    validate_oauth_token,
-    install_selfpipe_guard,
 )
 from click.core import ParameterSource
-from fastmcp import FastMCP
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from textwrap import dedent
 from enum import Enum
 from typing import Any, NoReturn
@@ -33,6 +21,11 @@ import click
 import os
 import sys
 import time
+
+# Heavy imports (fastmcp, starlette, windows_mcp.infrastructure submodules)
+# live inside the functions that need them — the MCP handshake deadline is
+# unforgiving, and CLI paths like `tools`/`call`/`doctor` shouldn't pay for
+# the serving stack at all.
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +55,7 @@ desktop: Any | None = None
 watchdog: Any | None = None
 analytics: Any | None = None
 screen_size: Any | None = None
-_mcp: FastMCP | None = None
+_mcp = None
 
 instructions = dedent("""
 Windows MCP server provides tools to interact directly with the Windows desktop,
@@ -86,6 +79,14 @@ def _http_middleware(
     allowed_hosts: list[str] | None = None,
 ) -> list:
     """Return ASGI middleware for HTTP transports."""
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from windows_mcp.infrastructure import (
+        AuthKeyMiddleware,
+        OAuthOnlyMiddleware,
+        IPAllowlistMiddleware,
+    )
+
     middleware: list = [
         Middleware(OptionsMiddleware, allowed_origins=cors_origins or []),
     ]
@@ -112,6 +113,14 @@ def _http_middleware(
     elif oauth_validator:
         middleware.append(Middleware(OAuthOnlyMiddleware, oauth_validator=oauth_validator))
     return middleware
+
+
+def build_oauth_routes(**kwargs):
+    """Lazy shim — keeps `cli.build_oauth_routes` patchable in tests while
+    deferring the starlette-heavy oauth module to HTTP serving only."""
+    from windows_mcp.infrastructure import build_oauth_routes as _impl
+
+    return _impl(**kwargs)
 
 
 def _param_explicit(ctx: click.Context, name: str) -> bool:
@@ -239,7 +248,7 @@ def _start_watchdog(desktop):
         return None
 
 
-def _build_mcp() -> FastMCP:
+def _build_mcp() -> "FastMCP":  # noqa: F821 — fastmcp is imported lazily
     """Create the MCP server instance."""
     global _mcp
 
@@ -247,6 +256,7 @@ def _build_mcp() -> FastMCP:
         return _mcp
 
     try:
+        from fastmcp import FastMCP
         from windows_mcp.infrastructure import PostHogAnalytics
         from windows_mcp.desktop.service import Desktop
         from windows_mcp.tools import register_all
@@ -254,7 +264,7 @@ def _build_mcp() -> FastMCP:
         _exit_missing_dependency(exc)
 
     @asynccontextmanager
-    async def lifespan(app: FastMCP):
+    async def lifespan(app):
         """Runs initialization code before the server starts and cleanup code after it shuts down."""
         global desktop, watchdog, analytics, screen_size
 
@@ -589,6 +599,14 @@ def serve(
     oauth_client_secret,
     stateless_http,
 ):
+    from windows_mcp.infrastructure import (
+        is_loopback_host,
+        parse_ip_allowlist,
+        OAuthStore,
+        validate_oauth_token,
+        install_selfpipe_guard,
+    )
+
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     install_selfpipe_guard()
     if transport == Transport.STDIO.value:
@@ -811,7 +829,18 @@ def _gen_tls(host: str, cert_path, key_path) -> None:
 
 
 _TASK_NAME = "windows-mcp-server"
+
+
+def _config_dir():
+    return CONFIG_DIR
+
+
 _START_SCRIPT_PATH = CONFIG_DIR / "start-server.cmd"
+
+
+def _start_script_path():
+    # read the module global at call time so tests can patch it
+    return globals()["_START_SCRIPT_PATH"]
 
 
 def _resolve_program() -> list[str]:
@@ -824,8 +853,8 @@ def _resolve_program() -> list[str]:
 
 
 def _build_start_script(program_args: list[str]) -> str:
-    log_out = CONFIG_DIR / "server.log"
-    log_err = CONFIG_DIR / "server.error.log"
+    log_out = _config_dir() / "server.log"
+    log_err = _config_dir() / "server.error.log"
     command = subprocess.list2cmdline(program_args)
     return f'@echo off\nsetlocal\n{command} 1>>"{log_out}" 2>>"{log_err}"\n'
 
@@ -873,16 +902,16 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
         click.echo("Use --force to reinstall.")
         return
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _config_dir().mkdir(parents=True, exist_ok=True)
 
     exe = _resolve_program()
     args = exe + ["serve", "--transport", transport, "--host", host, "--port", str(port)]
-    _START_SCRIPT_PATH.write_text(_build_start_script(args), encoding="utf-8")
+    _start_script_path().write_text(_build_start_script(args), encoding="utf-8")
 
     # Remove any existing task first when forcing a reinstall.
     _schtasks("/Delete", "/TN", _TASK_NAME, "/F")
 
-    result = _register_task_powershell(_TASK_NAME, str(_START_SCRIPT_PATH))
+    result = _register_task_powershell(_TASK_NAME, str(_start_script_path()))
     if result.returncode != 0:
         raise click.ClickException(
             f"Register-ScheduledTask failed:\n{result.stderr.strip() or result.stdout.strip()}"
@@ -898,7 +927,7 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
     click.echo(f"  Task      : {_TASK_NAME}")
     click.echo(f"  Transport : {transport}")
     click.echo(f"  Address   : {host}:{port}")
-    click.echo(f"  Logs      : {CONFIG_DIR / 'server.log'}")
+    click.echo(f"  Logs      : {_config_dir() / 'server.log'}")
     click.echo("\nThe server will restart automatically at every login.")
     click.echo("Run `windows-mcp uninstall` to remove it.")
 
@@ -916,9 +945,9 @@ def uninstall() -> None:
     else:
         click.echo("No scheduled task found.")
 
-    if _START_SCRIPT_PATH.exists():
-        _START_SCRIPT_PATH.unlink()
-        click.echo(f"Removed {_START_SCRIPT_PATH}")
+    if _start_script_path().exists():
+        _start_script_path().unlink()
+        click.echo(f"Removed {_start_script_path()}")
 
     click.echo("windows-mcp will no longer start at login.")
 
@@ -956,7 +985,7 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
         click.echo(f"Auth key already set in {config_path}. Use --force to regenerate.")
         return
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _config_dir().mkdir(parents=True, exist_ok=True)
 
     new_key = secrets.token_urlsafe(32)
     cfg.server.auth_key = new_key
@@ -968,8 +997,8 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
     if with_tls:
         if transport == "stdio":
             raise click.ClickException("TLS has no effect on stdio transport.")
-        cert_path = CONFIG_DIR / "cert.pem"
-        key_path = CONFIG_DIR / "key.pem"
+        cert_path = _config_dir() / "cert.pem"
+        key_path = _config_dir() / "key.pem"
         _gen_tls(host, cert_path, key_path)
         cfg.server.ssl_certfile = str(cert_path)
         cfg.server.ssl_keyfile = str(key_path)
