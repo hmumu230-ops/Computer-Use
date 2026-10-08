@@ -133,9 +133,20 @@ def _http_middleware(
     oauth_validator=None,
 ) -> list:
     """Return ASGI middleware for HTTP transports including CORS and OPTIONS handling."""
+    # Wildcard CORS + bearer auth lets any browser page drive the server.
+    # Default to loopback origins; MACOS_MCP_CORS_ORIGINS overrides (comma-
+    # separated, "*" to restore the old behavior explicitly).
+    origins_env = os.getenv("MACOS_MCP_CORS_ORIGINS", "")
+    allow_origins = (
+        [o.strip() for o in origins_env.split(",") if o.strip()]
+        or ["http://localhost", "http://127.0.0.1", "http://[::1]",
+            "https://localhost", "https://127.0.0.1", "https://[::1]",
+            "null"]  # "null" covers file:// and sandboxed iframes
+    )
     middleware = [
         Middleware(OptionsMiddleware),
-        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+        Middleware(CORSMiddleware, allow_origins=allow_origins,
+                   allow_methods=["*"], allow_headers=["*"]),
     ]
     if ip_allowlist:
         middleware.append(Middleware(IPAllowlistMiddleware, allowlist=ip_allowlist))

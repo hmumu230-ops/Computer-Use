@@ -21,10 +21,10 @@ classifiers = [
     "Development Status :: 4 - Beta",
 ]
 dependencies = [
-    "pyobjc-framework-ApplicationServices",
-    "pyobjc-framework-Cocoa",
-    "pyobjc-framework-Quartz",
-    "pyobjc-framework-Vision",
+    "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    "pyobjc-framework-Vision; sys_platform == 'darwin'",
     "pillow",
     "fastmcp",
     "tabulate",

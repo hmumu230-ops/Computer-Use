@@ -924,7 +924,11 @@ class Tree:
                     else self._desktop_correction
                 )
                 node = correct(attrs, node, window_name, main_window_bounding_box)
-                if node is not None and len(node.name.strip())>0:
+                if node is not None:
+                    if not node.name.strip():
+                        # Unnamed but interactive — dropping it makes it
+                        # unreachable; give it a role-derived label instead.
+                        node.name = f"<{role}>"
                     er = refs.STORE.add_element(
                         element=element,
                         pid=app_pid,

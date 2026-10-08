@@ -19,6 +19,7 @@ probe/search are injected callables supplied by the desktop service.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -52,8 +53,9 @@ class WindowRef:
 
 # Probe contract: probe(element) -> truthy when the element is alive.
 ProbeFn = Callable[[Any], bool]
-# Search contract: search(pid, role, name, nth) -> element | None.
-SearchFn = Callable[[int, str, str, int], Any]
+# Search contract: search(element_ref) -> element | None; the locator carries
+# pid/role/name/nth/bbox so the search can disambiguate same-role siblings.
+SearchFn = Callable[[ElementRef], Any]
 
 
 class RefStore:
@@ -67,17 +69,22 @@ class RefStore:
         self._w_seq = 0
         self._ordinals: dict[tuple, int] = {}
         self.created_at = time.time()
+        # Tree traversal mints refs from pooled worker threads — the seq
+        # counters and dicts below must never mutate without this lock or
+        # two workers can hand the same @eN to different elements.
+        self._lock = threading.Lock()
 
     # ---------- generation ----------
 
     def new_generation(self) -> int:
         """Mint a fresh generation; every prior ref goes stale."""
-        self.generation += 1
-        self.elements.clear()
-        self.windows.clear()
-        self._ordinals.clear()
-        self.created_at = time.time()
-        return self.generation
+        with self._lock:
+            self.generation += 1
+            self.elements.clear()
+            self.windows.clear()
+            self._ordinals.clear()
+            self.created_at = time.time()
+            return self.generation
 
     # ---------- registration ----------
 
@@ -91,66 +98,71 @@ class RefStore:
         metadata: dict | None = None,
     ) -> ElementRef:
         key = (pid, role, name)
-        nth = self._ordinals.get(key, 0)
-        self._ordinals[key] = nth + 1
-        self._e_seq += 1
-        er = ElementRef(
-            ref=f"@e{self._e_seq}",
-            pid=int(pid),
-            role=role or "",
-            name=name or "",
-            nth=nth,
-            bbox=bbox,
-            element=element,
-            generation=self.generation,
-            metadata=metadata or {},
-        )
-        self.elements[er.ref] = er
+        with self._lock:
+            nth = self._ordinals.get(key, 0)
+            self._ordinals[key] = nth + 1
+            self._e_seq += 1
+            er = ElementRef(
+                ref=f"@e{self._e_seq}",
+                pid=int(pid),
+                role=role or "",
+                name=name or "",
+                nth=nth,
+                bbox=bbox,
+                element=element,
+                generation=self.generation,
+                metadata=metadata or {},
+            )
+            self.elements[er.ref] = er
         return er
 
     def add_synthetic(self, bbox: dict, name: str,
                       metadata: dict | None = None) -> ElementRef:
         """OCR/visual hit — resolvable to coordinates only."""
-        self._e_seq += 1
-        er = ElementRef(
-            ref=f"@e{self._e_seq}",
-            pid=0,
-            role="synthetic",
-            name=name or "",
-            bbox=bbox,
-            element=None,
-            synthetic=True,
-            generation=self.generation,
-            metadata=metadata or {},
-        )
-        self.elements[er.ref] = er
+        with self._lock:
+            self._e_seq += 1
+            er = ElementRef(
+                ref=f"@e{self._e_seq}",
+                pid=0,
+                role="synthetic",
+                name=name or "",
+                bbox=bbox,
+                element=None,
+                synthetic=True,
+                generation=self.generation,
+                metadata=metadata or {},
+            )
+            self.elements[er.ref] = er
         return er
 
     def add_window(self, element: Any, pid: int, title: str,
                    geometry: dict | None = None) -> WindowRef:
-        self._w_seq += 1
-        wr = WindowRef(
-            ref=f"@w{self._w_seq}",
-            pid=int(pid),
-            title=title or "",
-            element=element,
-            geometry=geometry,
-            generation=self.generation,
-        )
-        self.windows[wr.ref] = wr
+        with self._lock:
+            self._w_seq += 1
+            wr = WindowRef(
+                ref=f"@w{self._w_seq}",
+                pid=int(pid),
+                title=title or "",
+                element=element,
+                geometry=geometry,
+                generation=self.generation,
+            )
+            self.windows[wr.ref] = wr
         return wr
 
     # ---------- lookup ----------
 
     def get(self, ref: str) -> ElementRef | WindowRef:
-        obj = self.elements.get(ref) or self.windows.get(ref)
+        with self._lock:
+            obj = self.elements.get(ref) or self.windows.get(ref)
+            generation = self.generation
         if obj is None:
             raise StaleRef(f"unknown ref {ref}",
                            hint="refs mint from Snapshot/list_windows")
-        if obj.generation != self.generation:
+        if obj.generation != generation:
             raise StaleRef(
                 f"{ref} is from generation {obj.generation} "
-                f"(current {self.generation})",
+                f"(current {generation})",
                 hint="take a fresh Snapshot")
         return obj
 
@@ -175,7 +187,7 @@ class RefStore:
 
         Args:
             probe: liveness check for the held element handle.
-            search: re-search fallback (pid, role, name, nth) -> element.
+            search: re-search fallback; receives the ElementRef locator.
 
         Returns:
             The ElementRef; ``element`` refreshed when re-search succeeds.
@@ -198,7 +210,7 @@ class RefStore:
         # 2. runtime re-search
         if search is not None:
             try:
-                el = search(er.pid, er.role, er.name, er.nth)
+                el = search(er)
             except Exception:
                 el = None
             if el is not None:
